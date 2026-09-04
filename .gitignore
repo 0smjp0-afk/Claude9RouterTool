@@ -1,0 +1,20 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- PyInstaller build artifacts ---
+build/
+dist/
+*.spec.bak
+
+# --- macOS / Windows junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- secrets / local config ---
+*.local
+.env
