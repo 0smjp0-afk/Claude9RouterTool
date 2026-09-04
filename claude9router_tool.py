@@ -2,18 +2,24 @@
 # ============================================================
 #  ابزار بکاپ/بازیابی Claude و 9router — ویندوز
 #  خروجی نهایی: EXE مستقل (PyInstaller) با GUI شیشه‌ای (PySide6)
-#  سرویس: Cloudflare Workers + Backblaze B2
+#  سرویس: ربات تلگرام — بکاپ مستقیماً به چت تلگرامی کاربر ارسال می‌شود
+#    Bot API؛ هر اجزا ≤۱۹MB (تحت سقف ۲۰MB دانلود ربات) پس ارسال و بازیابی
+#    خودکار حتی برای بکاپ‌های چند گیگابایتی ممکن است
 #  بکاپ سه مسیر پیش‌فرض:
 #    AppData\Local\Claude-3p
 #    AppData\Roaming\9router
 #    %USERPROFILE%\.claude
 #  + مسیرهای سفارشی (پوشه/فایل) انتخابی کاربر: %LOCALAPPDATA%\Claude9RouterTool\custom_paths.json
-#  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۹۸MB شکسته و آپلود می‌شود
-#  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← حذف بکاپ قبلی سرور ← آپلود بکاپ جدید
+#  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۱۹MB شکسته می‌شود
+#  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← ارسال بکاپ جدید به تلگرام ←
+#           پس از موفقیت کامل، پیام‌های بکاپ قبلی حذف می‌شوند (فقط آخرین بکاپ در چت می‌ماند)
 #  فایل‌های بازِ در حال استفاده با Snapshot (VSS) خوانده می‌شوند؛ فاصله بکاپ خودکار قابل تنظیم است
+#  توکن ربات با DPAPI ویندوز (متناسب با کاربر) رمزنگاری و در secrets.dat ذخیره می‌شود
 # ============================================================
 
+import base64
 import ctypes
+import ctypes.wintypes
 import glob
 import hashlib
 import json
@@ -32,26 +38,20 @@ import zipfile
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
-API_BASE = "https://[REDACTED-ENDPOINT]"
-API_UPLOAD = API_BASE + "/api/upload"
-API_FILES = API_BASE + "/api/files"
-API_DOWNLOAD = API_BASE + "/api/download/"
-API_DELETE = API_BASE + "/api/delete/"
-AUTH_KEY = "[REDACTED]"
 USER_AGENT = APP_NAME + "/" + APP_VERSION
 
-PART_TARGET = 98 * 1024 * 1024          # حداکثر حجم محتوای هر بخش زیپ (۹۸ مگابایت، زیر سقف ۱۰۰MB ورکر)
+TG_API_BASE = "https://api.telegram.org"
+
+PART_TARGET = 19 * 1024 * 1024          # حداکثر حجم محتوای هر بخش زیپ (۱۹MB — زیر سقف ۲۰MB دانلود ربات)
 CHUNK_THRESHOLD = 100 * 1024 * 1024     # فایل تکی بزرگ‌تر از این به تکه‌های خام شکسته می‌شود
-CHUNK_SIZE = 98 * 1024 * 1024           # حجم هر تکه برای فایل‌های بزرگ
-OLD_ARTIFACT_RE = re.compile(
-    r"^backup_\d{8}_\d{6}_(manifest\.json|log\.txt|part\d+\.zip|big\d+of\d+\.c9chunk)$"
-)
+CHUNK_SIZE = 19 * 1024 * 1024           # حجم هر تکه برای فایل‌های بزرگ
+TG_SEND_LIMIT = 50 * 1024 * 1024        # سقف ارسال Bot API
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024    # سقف دانلود Bot API (اجزای بکاپ با حاشیه امن زیر آن‌اند)
 
 SKIP_SUFFIXES = (".lock", ".tmp", ".part")
 SKIP_FILENAMES = {"SingletonCookie", "SingletonLock", "SingletonSocket"}
-MANIFEST_RE = re.compile(r"^(backup_\d{8}_\d{6})_manifest\.json$")
 
 _PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
@@ -314,6 +314,78 @@ def save_settings(d):
 
 
 # ------------------------------------------------------------
+#  رمزنگاری DPAPI ویندوز (حفاظت توکن ربات در دیسک)
+# ------------------------------------------------------------
+
+class CryptProtect:
+    """رمزنگاری/فارغ‌سازی متن با CryptProtectData (DPAPI — فقط همین کاربر ویندوز)."""
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    @classmethod
+    def protect(cls, text):
+        data = text.encode("utf-8")
+        buf = ctypes.create_string_buffer(data, len(data))
+        blob_in = cls._BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = cls._BLOB()
+        if not ctypes.windll.crypt32.CryptProtectData(
+                ctypes.byref(blob_in), "C9R", None, None, None, 0, ctypes.byref(blob_out)):
+            raise OSError("CryptProtectData ناموفق بود")
+        try:
+            return base64.b64encode(ctypes.string_at(blob_out.pbData, blob_out.cbData)).decode("ascii")
+        finally:
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+    @classmethod
+    def unprotect(cls, b64_text):
+        raw = base64.b64decode(b64_text)
+        buf = ctypes.create_string_buffer(raw, len(raw))
+        blob_in = cls._BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = cls._BLOB()
+        if not ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+            raise OSError("CryptUnprotectData ناموفق بود (فایل روی این حساب ساخته نشده؟)")
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData).decode("utf-8")
+        finally:
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+# ------------------------------------------------------------
+#  تنظیمات تلگرام
+#    settings.json: tg_chat_id، tg_last_backup (وضعیت آخرین بکاپ ارسالی)
+#    secrets.dat:   توکن ربات با DPAPI ویندوز رمزنگاری‌شده
+# ------------------------------------------------------------
+
+SECRETS_PATH = os.path.join(localappdata(), APP_NAME, "secrets.dat")
+
+
+def load_secrets():
+    try:
+        with open(longpath(SECRETS_PATH), "r", encoding="utf-8") as f:
+            enc = json.load(f)
+        return {"token": CryptProtect.unprotect(enc["token_b64"]) if enc.get("token_b64") else ""}
+    except Exception:
+        return {"token": ""}
+
+
+def save_secrets(token):
+    enc = {"token_b64": CryptProtect.protect(token) if token else ""}
+    os.makedirs(os.path.dirname(longpath(SECRETS_PATH)), exist_ok=True)
+    with open(longpath(SECRETS_PATH), "w", encoding="utf-8") as f:
+        json.dump(enc, f, indent=1)
+
+
+def tg_credentials_ready():
+    s = load_settings()
+    secrets = load_secrets()
+    if not secrets.get("token") or not s.get("tg_chat_id"):
+        return False, secrets
+    return True, secrets
+
+
+# ------------------------------------------------------------
 #  ساخت مجموعه بکاپ (سه مسیر پیش‌فرض + مسیرهای سفارشی)
 # ------------------------------------------------------------
 
@@ -559,98 +631,199 @@ def build_manifest(run_id_, sources, files, dirs, warnings, parts):
 
 
 # ------------------------------------------------------------
-#  ارتباط با سرور (ورکر Cloudflare)
+#  ارتباط با تلگرام (Bot API)
+#  هر جزء بکاپ (زیپ/تکه/مانیفست/لاگ) به‌صورت Document به چت کاربر ارسال و
+#  file_id آن در «شاخص بکاپ» ثبت می‌شود؛ بازیابی با دانلود file_id انجام می‌شود.
 # ------------------------------------------------------------
 
-def api_files_list():
-    req = urllib.request.Request(API_FILES, headers={"X-Auth-Key": AUTH_KEY, "User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = json.loads(r.read().decode("utf-8"))
-    files = data.get("files") if isinstance(data, dict) else None
-    if not isinstance(files, list):
-        raise RuntimeError("پاسخ نامعتبر از سرور: " + str(data)[:200])
-    return files
+def tg_request(token, method, params=None, timeout=60):
+    """فراخوانی متد Bot API با فرم urlencode؛ پاسخ JSON برمی‌گردد.
+    محدودیت نرخ (HTTP 429) با انتظار مطابق Retry-After به‌صورت خودکار مدیریت می‌شود."""
+    url = TG_API_BASE + "/bot" + token + "/" + method
+    data = urllib.parse.urlencode(params or {}).encode("utf-8")
+    last_ex = None
+    for _attempt in range(5):
+        req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as ex:
+            if ex.code == 429:
+                try:
+                    wait = int(ex.headers.get("Retry-After", "3"))
+                except (TypeError, ValueError):
+                    wait = 3
+                time.sleep(min(wait + 1, 35))
+                last_ex = ex
+                continue
+            raise
+    raise last_ex or RuntimeError("فراخوانی تلگرام ناموفق بود")
 
 
-def upload_file(path, key, ctype="application/zip", timeout=900):
-    """آپلود multipart/form-data مطابق worker.js (فیلد file + فیلد name)."""
+def tg_test_connection(token, chat_id=None):
+    """getMe و در صورت وجود chat_id، getChat — برمی‌گرداند (ok, پیام)."""
+    try:
+        me = tg_request(token, "getMe")
+        if not me.get("ok"):
+            return False, "پاسخ نامعتبر از تلگرام"
+        name = "@" + me["result"].get("username", "?")
+        if chat_id:
+            chat = tg_request(token, "getChat", {"chat_id": str(chat_id)})
+            if not chat.get("ok"):
+                return False, "ربات " + name + " وصل شد ولی chat_id نامعتبر است: " + str(chat.get("description", ""))
+            cinfo = chat["result"]
+            ctitle = cinfo.get("username") or cinfo.get("first_name") or str(chat_id)
+            return True, "✓ ربات " + name + " به چت «" + ctitle + "» وصل است"
+        return True, "✓ ربات " + name + " معتبر است (chat_id داده نشد)"
+    except urllib.error.HTTPError as ex:
+        try:
+            desc = json.loads(ex.read().decode("utf-8")).get("description", "")
+        except Exception:
+            desc = str(ex)
+        return False, "خطا: " + desc
+    except Exception as ex:
+        return False, "خطا: " + str(ex)
+
+
+def tg_detect_chat_id(token):
+    """آخرین فرستندهٔ پیام به ربات را از getUpdates می‌خواند؛ (chat_id, نام) برمی‌گرداند.
+    کاربر باید یکبار به ربات پیام بدهد (مثلاً /start)."""
+    upd = tg_request(token, "getUpdates", {"limit": 100})
+    if not upd.get("ok"):
+        raise RuntimeError("getUpdates ناموفق: " + str(upd)[:200])
+    best = None
+    for u in upd.get("result", []):
+        msg = u.get("message") or u.get("edited_message") or u.get("channel_post")
+        if not msg:
+            continue
+        chat = msg.get("chat", {})
+        date = msg.get("date", 0)
+        if chat.get("id") is not None and (best is None or date > best[0]):
+            best = (date, chat["id"], chat.get("username") or chat.get("first_name") or "")
+    if not best:
+        raise RuntimeError("هیچ پیامی به ربات نرسیده؛ ابتدا در تلگرام به ربات پیام بده (مثلاً /start)")
+    return best[1], best[2]
+
+
+def tg_send_document(token, chat_id, path, caption=None, timeout=900):
+    """ارسال فایل به‌صورت Document؛ (message_id, file_id) برمی‌گرداند."""
     with open(longpath(path), "rb") as f:
         data = f.read()
     boundary = "----c9rbnd" + uuid.uuid4().hex
     fname = os.path.basename(path).replace('"', "")
-    head = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{fname}"\r\n'
-        f"Content-Type: {ctype}\r\n\r\n"
-    ).encode("utf-8")
-    tail = (
-        f"\r\n--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="name"\r\n\r\n'
-        f"{key}\r\n"
-        f"--{boundary}--\r\n"
-    ).encode("utf-8")
-    body = head + data + tail
+    chunks = []
+    chunks.append(("--" + boundary + "\r\n"
+                   "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+                   + str(chat_id) + "\r\n").encode("utf-8"))
+    if caption:
+        chunks.append(("--" + boundary + "\r\n"
+                       "Content-Disposition: form-data; name=\"caption\"\r\n\r\n"
+                       + caption[:1024] + "\r\n").encode("utf-8"))
+    chunks.append(("--" + boundary + "\r\n"
+                   "Content-Disposition: form-data; name=\"document\"; filename=\""
+                   + fname + "\"\r\n"
+                   "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8"))
+    body = b"".join(chunks) + data + ("\r\n--" + boundary + "--\r\n").encode("utf-8")
     req = urllib.request.Request(
-        API_UPLOAD, data=body, method="POST",
+        TG_API_BASE + "/bot" + token + "/sendDocument", data=body, method="POST",
         headers={
-            "X-Auth-Key": AUTH_KEY,
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
             "User-Agent": USER_AGENT,
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+        res = json.loads(r.read().decode("utf-8"))
+    if not res.get("ok"):
+        raise RuntimeError("ارسال ناموفق: " + str(res)[:200])
+    msg = res["result"]
+    doc = msg.get("document") or {}
+    return msg["message_id"], doc.get("file_id", "")
 
 
-def download_file(key, dest):
-    url = API_DOWNLOAD + urllib.parse.quote(key, safe="")
-    req = urllib.request.Request(url, headers={"X-Auth-Key": AUTH_KEY, "User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=900) as r, open(longpath(dest), "wb") as f:
+def tg_download_document(token, file_id, dest, timeout=900):
+    """دانلود Document با getFile و ذخیرهٔ استریمی در dest."""
+    info = tg_request(token, "getFile", {"file_id": file_id}, timeout=120)
+    if not info.get("ok"):
+        raise RuntimeError("getFile ناموفق: " + str(info)[:200])
+    fp = info["result"]["file_path"]
+    url = TG_API_BASE + "/file/bot" + token + "/" + urllib.parse.quote(fp, safe="")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(longpath(dest), "wb") as f:
         shutil.copyfileobj(r, f, 1024 * 256)
 
 
-def delete_remote_file(key):
-    url = API_DELETE + urllib.parse.quote(key, safe="")
-    req = urllib.request.Request(url, method="DELETE", headers={"X-Auth-Key": AUTH_KEY, "User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def delete_previous_backup(files, new_run_id, rep=None):
-    """همه آثار بکاپ‌های قبلی (به‌جز بکاپ جدید) را از سرور حذف می‌کند.
-    برمی‌گرداند: (deleted_count, failed_keys)"""
-    deleted, failed = 0, []
-    for f in files:
-        key = f.get("key", "")
-        if not key or key.startswith(new_run_id + "_"):
-            continue
-        if not OLD_ARTIFACT_RE.match(key):
-            continue
+def tg_delete_messages(token, chat_id, message_ids, rep=None):
+    """حذف پیام‌های چت (پاک‌سازی بکاپ قبلی). تعداد حذف‌شدهٔ موفق برمی‌گردد."""
+    ok = 0
+    for mid in message_ids:
         try:
-            delete_remote_file(key)
-            deleted += 1
-            if rep:
-                rep(f"  🗑 حذف {key}")
+            tg_request(token, "deleteMessage", {"chat_id": str(chat_id), "message_id": str(mid)})
+            ok += 1
         except Exception as ex:
-            failed.append(key)
             if rep:
-                rep(f"  ✗ حذف {key} ناموفق: {ex}")
-    return deleted, failed
+                rep("  حذف پیام " + str(mid) + " ناموفق: " + str(ex)[:120])
+        time.sleep(0.15)  # محدودیت نرخ تلگرام
+    return ok
 
 
-def pick_latest_run(files):
-    """جدیدترین بکاپ کامل (با مانیفست) را از فهرست سرور برمی‌گرداند."""
-    best = None
-    for f in files:
-        m = MANIFEST_RE.match(f.get("key", ""))
-        if not m:
-            continue
-        score = (f.get("uploaded", ""), m.group(1))
-        if best is None or score > best[0]:
-            best = (score, m.group(1), f["key"])
-    if not best:
-        return None
-    return best[1], best[2]
+# ------------------------------------------------------------
+#  وضعیت تلگرام (tg_state.json — شاخص آخرین بکاپ + پیام‌های نیمه‌کاره)
+# ------------------------------------------------------------
+
+def tg_state_path():
+    return os.path.join(localappdata(), APP_NAME, "tg_state.json")
+
+
+def load_tg_state():
+    try:
+        with open(longpath(tg_state_path()), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_tg_state(state):
+    try:
+        os.makedirs(os.path.dirname(longpath(tg_state_path())), exist_ok=True)
+        with open(longpath(tg_state_path()), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def build_backup_index(run_id_, chat_id, files_map, manifest_entry, log_entry, total_files, total_size):
+    """شاخص بکاپ: نگاشت نام جزء به file_id تلگرام (بازیابی) + شناسه پیام‌ها (حذف بکاپ قبلی)."""
+    return {
+        "schema_version": 1,
+        "tool": APP_NAME + " v" + APP_VERSION,
+        "run_id": run_id_,
+        "created_at": now_iso(),
+        "chat_id": str(chat_id),
+        "files": files_map,          # {نام جزء: {file_id, message_id, size}}
+        "manifest": manifest_entry,  # {name, file_id, message_id, size}
+        "log": log_entry,
+        "total_files": total_files,
+        "total_size": total_size,
+    }
+
+
+def collect_backup_messages(last_index):
+    """همه شناسه پیام‌های یک بکاپ (اجزا + شاخص) را برمی‌گرداند."""
+    msgs = []
+    for entry in (last_index.get("files") or {}).values():
+        mid = entry.get("message_id")
+        if isinstance(mid, int) and mid > 0:
+            msgs.append(mid)
+    for entry in (last_index.get("manifest"), last_index.get("log")):
+        if isinstance(entry, dict):
+            mid = entry.get("message_id")
+            if isinstance(mid, int) and mid > 0:
+                msgs.append(mid)
+    mid = last_index.get("index_message_id")
+    if isinstance(mid, int) and mid > 0:
+        msgs.append(mid)
+    return msgs
 
 
 def extract_zip_safe(path, dest_dir):
@@ -749,7 +922,12 @@ def run_backup(upload=True, out_dir=None, rep=None):
 
     try:
         with zipfile.ZipFile(longpath(archives[0][1]), "a", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("backup_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8"))
+            # خلاصهٔ مانیفست (بدون فهرست کامل فایل‌ها) تا زیپ بخش اول از سقف دانلود ربات (۲۰MB) رد نشود؛
+            # مانیفست کامل به‌صورت Document جداگانه ارسال می‌شود
+            summary = {k: v for k, v in manifest.items() if k not in ("files", "dirs")}
+            summary["files_count"] = len(files)
+            summary["dirs_count"] = len(dirs)
+            z.writestr("backup_manifest_summary.json", json.dumps(summary, ensure_ascii=False, indent=1).encode("utf-8"))
             z.writestr("backup.log", log_text.encode("utf-8"))
     except Exception as ex:
         warnings.append("افزودن لاگ به بخش اول ناموفق: " + str(ex))
@@ -765,13 +943,13 @@ def run_backup(upload=True, out_dir=None, rep=None):
 
     if not upload:
         if rep:
-            rep("آپلود به سرور غیرفعال است (حالت محلی).")
+            rep("آپلود غیرفعال است (حالت محلی).")
         if vss:
             vss.delete()
         logger.close()
         return 0
 
-    # --- گام اعتبارسنجی: مطمئن شو همه اجزای بکاپ محلی کامل‌اند ---
+    # --- اعتبارسنجی بکاپ محلی (پیش از هر تماس با تلگرام) ---
     uploads = [(name, path, sz) for (name, path, _cnt, sz) in archives] + list(chunk_artifacts)
     verify = list(uploads) + [
         (run_id_ + "_manifest.json", manifest_path, 0),
@@ -781,90 +959,161 @@ def run_backup(upload=True, out_dir=None, rep=None):
     if missing:
         if rep:
             for mname in missing:
-                rep(f"  ✗ جزء محلی یافت نشد: {mname}")
-            rep("بکاپ محلی ناقص است؛ بکاپ‌های قبلی سرور دست‌نخورده ماندند.")
+                rep("  ✗ جزء محلی یافت نشد: " + mname)
+            rep("بکاپ محلی ناقص است؛ بکاپ قبلی تلگرام دست‌نخورده ماند.")
         if vss:
             vss.delete()
         logger.close()
         return 1
     if rep:
-        rep(f"✓ بکاپ محلی کامل و سالم است ({len(verify)} جزء)؛ اکنون بکاپ‌های قبلی سرور حذف می‌شوند.")
+        rep("✓ بکاپ محلی کامل و سالم است (" + str(len(verify)) + " جزء)؛ آماده ارسال به تلگرام.")
 
-    # --- گام حذف بکاپ‌های قبلی سرور ---
-    remote_files = None
-    try:
-        remote_files = api_files_list()
-    except Exception as ex:
+    # --- اعتبارنامه تلگرام ---
+    ready, secrets = tg_credentials_ready()
+    if not ready:
         if rep:
-            rep("  خطا در دریافت فهرست سرور: " + str(ex))
-    if remote_files is not None:
-        deleted, del_failed = delete_previous_backup(remote_files, run_id_, rep=rep)
-        if rep:
-            msg_ = f"  {deleted} فایل از بکاپ‌های قبلی سرور حذف شد"
-            if del_failed:
-                msg_ += f" ({len(del_failed)} مورد ناموفق)"
-            rep(msg_)
-    else:
-        if rep:
-            rep("  فهرست سرور خوانده نشد؛ بکاپ‌های قبلی حذف نشدند (ادامه با آپلود معمولی).")
+            rep("✗ اتصال تلگرام تنظیم نشده است؛ ابتدا توکن ربات و chat_id را از دکمه «اتصال تلگرام» وارد کن.")
+        if vss:
+            vss.delete()
+        logger.close()
+        return 1
+    token = secrets["token"]
+    chat_id = load_settings().get("tg_chat_id")
 
-    # --- گام آپلود بکاپ جدید ---
     if rep:
-        rep("آپلود بکاپ جدید به سرور...")
+        rep("✓ اتصال تلگرام بررسی شد.")
+
+    # --- ارسال اجزای بکاپ به تلگرام (بکاپ قبلی هنوز دست‌نخورده) ---
+    if rep:
+        rep("ارسال بکاپ جدید به تلگرام...")
     all_ok = True
+    files_map = {}      # نام جزء → {file_id, message_id, size}
+    sent_messages = []  # همه پیام‌های این بکاپ (شاخص + لاگ) برای ثبت در state
+    caption = "🗄 Claude9RouterTool — بکاپ " + run_id_
     for name, path, sz in uploads:
-        ctype = "application/zip" if name.endswith(".zip") else "application/octet-stream"
-        success = False
+        ok_part = False
         for attempt in range(1, 4):
             try:
                 if rep:
-                    rep(f"  آپلود {name} ({format_bytes(sz)}) — تلاش {attempt}")
-                res = upload_file(path, name, ctype)
-                if res.get("success"):
-                    if rep:
-                        rep(f"  ✓ {name} آپلود شد")
-                    success = True
-                    break
+                    rep("  ارسال " + name + " (" + format_bytes(sz) + ") — تلاش " + str(attempt))
+                mid, fid = tg_send_document(token, chat_id, path,
+                                            caption=caption if name.endswith(".zip") else None)
+                files_map[name] = {"file_id": fid, "message_id": mid, "size": sz}
+                sent_messages.append(mid)
                 if rep:
-                    rep("  پاسخ غیرمنتظره سرور: " + str(res)[:200])
+                    rep("  ✓ " + name)
+                ok_part = True
+                break
             except Exception as ex:
                 if rep:
                     rep("  خطا: " + str(ex))
                 if attempt < 3:
                     time.sleep(2 * attempt)
-        if not success:
+        if not ok_part:
             if rep:
-                rep(f"  ✗ آپلود {name} ناموفق بود")
+                rep("  ✗ ارسال " + name + " ناموفق بود")
             all_ok = False
 
     if not all_ok:
         if rep:
-            rep("برخی بخش‌ها آپلود نشدند؛ مانیفست آپلود نشد تا بکاپ ناقص بازیابی نشود.")
+            rep("برخی اجزا ارسال نشدند؛ شاخص آپلود نمی‌شود تا بکاپ ناقص بازیابی نشود و بکاپ قبلی حفظ می‌ماند.")
+        # پاک‌سازی اجزای نیمه‌کاره (تا چت شلوغ نشود) و ثبت آن‌ها برای حذف در اجرای بعدی
+        if sent_messages:
+            deleted_orphan = tg_delete_messages(token, chat_id, sent_messages, rep=rep)
+            if rep:
+                rep("  " + str(deleted_orphan) + " پیام نیمه‌کاره پاک شد.")
         if vss:
             vss.delete()
         logger.close()
         return 1
 
-    for key, path, ctype in (
-        (run_id_ + "_manifest.json", manifest_path, "application/json"),
-        (run_id_ + "_log.txt", log_path, "text/plain"),
-    ):
+    # --- ارسال مانیفست و لاگ (بازیابی به مانیفست نیاز دارد) ---
+    for key, path in ((run_id_ + "_manifest.json", manifest_path),
+                      (run_id_ + "_log.txt", log_path)):
         try:
-            res = upload_file(path, key, ctype)
-            if res.get("success"):
-                if rep:
-                    rep(f"  ✓ {key} آپلود شد")
-            else:
-                if rep:
-                    rep("  ✗ " + key + ": " + str(res)[:200])
-                all_ok = False
+            mid, fid = tg_send_document(token, chat_id, path)
+            files_map[key] = {"file_id": fid, "message_id": mid,
+                              "size": os.path.getsize(longpath(path))}
+            sent_messages.append(mid)
+            if rep:
+                rep("  ✓ " + key)
         except Exception as ex:
             if rep:
-                rep("  ✗ خطا در آپلود " + key + ": " + str(ex))
+                rep("  ✗ ارسال " + key + " ناموفق: " + str(ex))
             all_ok = False
+    if not all_ok:
+        tg_delete_messages(token, chat_id, sent_messages, rep=rep)
+        if rep:
+            rep("  پیام‌های نیمه‌کاره پاک شدند؛ بکاپ قبلی حفظ ماند.")
+        if vss:
+            vss.delete()
+        logger.close()
+        return 1
 
-    if all_ok and rep:
-        rep("بکاپ کامل شد و به سرور ارسال گردید (بکاپ‌های قبلی حذف شدند).")
+    # --- ارسال شاخص بکاپ (آخرین گام؛ فقط پس از موفقیت همه اجزا) ---
+    index = build_backup_index(run_id_, chat_id, files_map,
+                               files_map.get(run_id_ + "_manifest.json", {}),
+                               files_map.get(run_id_ + "_log.txt", {}),
+                               sum(1 for e in files if e.get("status", "ok") == "ok"),
+                               sum(e["size"] for e in files))
+    index_path = os.path.join(out_dir, run_id_ + "_index.json")
+    try:
+        with open(longpath(index_path), "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=1)
+    except OSError as ex:
+        if rep:
+            rep("✗ نوشتن شاخص ناموفق بود: " + str(ex))
+        if vss:
+            vss.delete()
+        logger.close()
+        return 1
+
+    try:
+        mid, fid = tg_send_document(token, chat_id, index_path,
+                                    caption="📋 شاخص بکاپ " + run_id_)
+    except Exception as ex:
+        if rep:
+            rep("  ✗ ارسال شاخص ناموفق: " + str(ex))
+        tg_delete_messages(token, chat_id, sent_messages, rep=rep)
+        if rep:
+            rep("  پیام‌های نیمه‌کاره پاک شدند.")
+        if vss:
+            vss.delete()
+        logger.close()
+        return 1
+
+    sent_messages.append(mid)
+    if rep:
+        rep("  ✓ شاخص بکاپ ارسال شد")
+
+    # --- ثبت وضعیت محلی (فقط پس از موفقیت کامل) ---
+    prev_state = load_tg_state()
+    state = {
+        "last_index": {
+            "run_id": run_id_,
+            "index_file_id": fid,
+            "index_message_id": mid,
+            "created_at": index["created_at"],
+            "files": files_map,
+            "total_files": index["total_files"],
+            "total_size": index["total_size"],
+        },
+        "orphan_message_ids": [],
+    }
+    save_tg_state(state)
+
+    # --- حذف بکاپ قبلی (پس از ثبت موفق بکاپ جدید) ---
+    prev_index = prev_state.get("last_index") if isinstance(prev_state, dict) else None
+    if prev_index and prev_index.get("run_id") and prev_index["run_id"] != run_id_:
+        old_msgs = collect_backup_messages(prev_index)
+        if old_msgs:
+            if rep:
+                rep("حذف بکاپ قبلی از تلگرام (" + str(len(old_msgs)) + " پیام)...")
+            deleted_prev = tg_delete_messages(token, chat_id, old_msgs, rep=rep)
+            if rep:
+                rep("  🗑 " + str(deleted_prev) + " پیام بکاپ قبلی حذف شد.")
+    if rep:
+        rep("بکاپ کامل شد و به تلگرام ارسال گردید (فقط آخرین بکاپ در چت باقی می‌ماند).")
     if vss:
         vss.delete()
     logger.close()
@@ -986,26 +1235,40 @@ def run_restore(parts_dir=None, rep=None):
             rep(f"حالت محلی: بکاپ {run_id_} از {parts_dir} بازیابی می‌شود.")
     else:
         if rep:
-            rep("دریافت فهرست بکاپ‌ها از سرور...")
-        try:
-            files = api_files_list()
-        except Exception as ex:
+            rep("خواندن وضعیت آخرین بکاپ تلگرام...")
+        state = load_tg_state()
+        last_index = state.get("last_index") if isinstance(state, dict) else None
+        if not last_index or not last_index.get("run_id"):
             if rep:
-                rep("خطا در دریافت فهرست از سرور: " + str(ex))
+                rep("هیچ بکاپی روی تلگرام ثبت نشده (شاخص یافت نشد).")
             logger.close()
             return 1
-        picked = pick_latest_run(files)
-        if not picked:
-            if rep:
-                rep("هیچ بکاپ کاملی در سرور پیدا نشد (مانیفست یافت نشد).")
-            logger.close()
-            return 1
-        run_id_, mkey = picked
+        run_id_ = last_index["run_id"]
         if rep:
-            rep(f"جدیدترین بکاپ: {run_id_}")
+            rep("جدیدترین بکاپ: " + run_id_)
+
+        ready, secrets = tg_credentials_ready()
+        if not ready:
+            if rep:
+                rep("✗ اتصال تلگرام تنظیم نشده است؛ ابتدا توکن ربات و chat_id را وارد کن.")
+            logger.close()
+            return 1
+        token = secrets["token"]
+        chat_id = load_settings().get("tg_chat_id")
+
+        dl_dir = os.path.join(staging, "parts")
+        os.makedirs(dl_dir, exist_ok=True)
+
+        # مانیفست: دانلود با file_id ثبت‌شده در شاخص
+        m_entry = (last_index.get("files") or {}).get(run_id_ + "_manifest.json")
+        if not m_entry or not m_entry.get("file_id"):
+            if rep:
+                rep("file_id مانیفست در شاخص یافت نشد؛ شاخص ناقص است.")
+            logger.close()
+            return 1
         try:
-            mpath = os.path.join(staging, mkey)
-            download_file(mkey, mpath)
+            mpath = os.path.join(dl_dir, run_id_ + "_manifest.json")
+            tg_download_document(token, m_entry["file_id"], mpath)
             with open(mpath, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
         except Exception as ex:
@@ -1013,8 +1276,6 @@ def run_restore(parts_dir=None, rep=None):
                 rep("خطا در دانلود مانیفست: " + str(ex))
             logger.close()
             return 1
-        dl_dir = os.path.join(staging, "parts")
-        os.makedirs(dl_dir, exist_ok=True)
 
     if not isinstance(manifest.get("files"), list):
         if rep:
@@ -1043,15 +1304,21 @@ def run_restore(parts_dir=None, rep=None):
 
     if not parts_dir:
         for pk in part_keys:
-            if rep:
-                rep(f"دانلود {pk}...")
-            try:
-                download_file(pk, os.path.join(dl_dir, pk))
+            entry = (last_index.get("files") or {}).get(pk)
+            if not entry or not entry.get("file_id"):
                 if rep:
-                    rep(f"  ✓ {pk}")
+                    rep("  ✗ جزء " + pk + " در شاخص ثبت نشده؛ بکاپ ناقص است.")
+                logger.close()
+                return 1
+            if rep:
+                rep("دانلود " + pk + "...")
+            try:
+                tg_download_document(token, entry["file_id"], os.path.join(dl_dir, pk))
+                if rep:
+                    rep("  ✓ " + pk)
             except Exception as ex:
                 if rep:
-                    rep(f"  ✗ دانلود {pk} ناموفق: {ex}")
+                    rep("  ✗ دانلود " + pk + " ناموفق: " + str(ex))
                 logger.close()
                 return 1
 
@@ -1264,7 +1531,8 @@ def selftest():
             os.path.isfile(os.path.join(out, k)) for k in chunk_keys))
         with zipfile.ZipFile(longpath(os.path.join(out, archives[0]))) as z:
             names = z.namelist()
-        check("بخش اول شامل مانیفست و لاگ است", "backup_manifest.json" in names and "backup.log" in names)
+        check("بخش اول شامل خلاصهٔ مانیفست و لاگ است",
+              "backup_manifest_summary.json" in names and "backup.log" in names)
         check("پوشه خالی در آرشیو ثبت شده", any(n == "Claude-3p/empty_dir/" for n in names))
 
         for p in (L, R, U, C):
@@ -1555,10 +1823,12 @@ if _try_sys_imports():
             self.btn_auto.setObjectName("btnSecondary")
             self.btn_paths = QPushButton("مسیرهای سفارشی...")
             self.btn_paths.setObjectName("btnSecondary")
+            self.btn_tg = QPushButton("اتصال تلگرام...")
+            self.btn_tg.setObjectName("btnSecondary")
             self.btn_exit = QPushButton("خروج")
             self.btn_exit.setObjectName("btnExit")
 
-            hint = QLabel("پس از بازگردانی، نصب‌کننده Claude اجرا، npm جهانی بازنصب و پوشه ‎.claude بازیابی می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
+            hint = QLabel("بکاپ مستقیماً به چت تلگرامت ارسال می‌شود و فقط آخرین بکاپ در چت می‌ماند. پس از بازگردانی، نصب‌کننده Claude اجرا و npm جهانی بازنصب می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
             hint.setObjectName("appSub")
             hint.setWordWrap(True)
 
@@ -1567,6 +1837,7 @@ if _try_sys_imports():
             row = QHBoxLayout()
             row.addWidget(self.btn_auto, 1)
             row.addWidget(self.btn_paths)
+            row.addWidget(self.btn_tg)
             cl.addLayout(row)
             cl.addWidget(hint)
 
@@ -1592,6 +1863,9 @@ if _try_sys_imports():
             self.btn_restore.clicked.connect(self.do_restore)
             self.btn_paths.clicked.connect(self.manage_paths)
             self.btn_auto.clicked.connect(self.toggle_auto)
+            self.btn_tg.clicked.connect(self.manage_telegram)
+
+            self._refresh_tg_button()
 
         def toggle_auto(self):
             if self.auto_timer is None:
@@ -1665,10 +1939,25 @@ if _try_sys_imports():
             sb = self.log.verticalScrollBar()
             sb.setValue(sb.maximum())
 
+        def _refresh_tg_button(self):
+            ready, _sec = tg_credentials_ready()
+            if ready:
+                self.btn_tg.setText("اتصال تلگرام: ✓ فعال")
+            elif load_secrets().get("token") or load_settings().get("tg_chat_id"):
+                self.btn_tg.setText("اتصال تلگرام: ناقص!")
+            else:
+                self.btn_tg.setText("اتصال تلگرام...")
+
+        def manage_telegram(self):
+            dlg = TelegramDialog(self)
+            dlg.exec()
+            self._refresh_tg_button()
+
         def _set_busy(self, busy, status=""):
             self.btn_backup.setEnabled(not busy)
             self.btn_restore.setEnabled(not busy)
             self.btn_paths.setEnabled(not busy)
+            self.btn_tg.setEnabled(not busy)
             self.btn_exit.setEnabled(not busy)
             self.lbl_status.setText(status)
 
@@ -1732,6 +2021,82 @@ if _try_sys_imports():
             s["auto_interval_minutes"] = self.minutes
             save_settings(s)
             super().accept()
+
+    class TelegramDialog(QDialog):
+        """تنظیم اتصال تلگرام: توکن ربات، تشخیص خودکار chat_id از آخرین پیام به ربات
+        یا ورود دستی آن؛ آزمایش اتصال با getMe/getChat."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("اتصال تلگرام")
+            self.setFixedSize(560, 320)
+            v = QVBoxLayout(self)
+            v.addWidget(QLabel("۱) از @BotFather توکن ربات بگیر و اینجا وارد کن."))
+            v.addWidget(QLabel("۲) در تلگرام به ربات یک پیام بده (مثلاً /start) تا chat_id شناسایی شود."))
+            v.addWidget(QLabel("توکن ربات (با DPAPI ویندوز رمزنگاری و ذخیره می‌شود):"))
+            from PySide6.QtWidgets import QLineEdit
+            self.ed_token = QLineEdit()
+            self.ed_token.setEchoMode(QLineEdit.EchoMode.Password)
+            if load_secrets().get("token"):
+                self.ed_token.setPlaceholderText("توکن فعلی ذخیره شده — برای تغییر، جایگزینش کن")
+            v.addWidget(self.ed_token)
+            v.addWidget(QLabel("Chat ID (خالی بگذار تا از آخرین پیام به ربات شناسایی شود):"))
+            self.ed_chat = QLineEdit()
+            s = load_settings()
+            if s.get("tg_chat_id"):
+                self.ed_chat.setText(str(s.get("tg_chat_id")))
+            v.addWidget(self.ed_chat)
+            h = QHBoxLayout()
+            self.b_test = QPushButton("تست اتصال")
+            self.b_save = QPushButton("ذخیره و فعال‌سازی")
+            self.b_cancel = QPushButton("انصراف")
+            for b in (self.b_test, self.b_save, self.b_cancel):
+                h.addWidget(b)
+            v.addLayout(h)
+            self.lbl_result = QLabel("")
+            self.lbl_result.setWordWrap(True)
+            v.addWidget(self.lbl_result)
+
+            self.b_test.clicked.connect(self.do_test)
+            self.b_save.clicked.connect(self.do_save)
+            self.b_cancel.clicked.connect(self.reject)
+
+        def _token(self):
+            t = self.ed_token.text().strip()
+            if not t:
+                t = load_secrets().get("token", "")
+            return t
+
+        def do_test(self):
+            ok, msg = tg_test_connection(self._token(), self.ed_chat.text().strip() or None)
+            self.lbl_result.setText(msg)
+
+        def do_save(self):
+            token = self._token()
+            if not token:
+                self.lbl_result.setText("✗ توکن ربات را وارد کن.")
+                return
+            chat = self.ed_chat.text().strip()
+            ok, msg = tg_test_connection(token, chat or None)
+            if not ok:
+                self.lbl_result.setText("✗ " + msg)
+                return
+            if not chat:
+                try:
+                    chat, who = tg_detect_chat_id(token)
+                except Exception as ex:
+                    self.lbl_result.setText("✗ chat_id شناسایی نشد: " + str(ex))
+                    return
+                ok, msg = tg_test_connection(token, str(chat))
+                if not ok:
+                    self.lbl_result.setText("✗ " + msg)
+                    return
+            s = load_settings()
+            s["tg_chat_id"] = str(chat)
+            save_settings(s)
+            save_secrets(token)
+            self.lbl_result.setText("✓ اتصال ذخیره شد — از این پس بکاپ‌ها به تلگرامت ارسال می‌شود.")
+            self.accept()
 
     def run_gui():
         """رندر پنجره به فایل PNG (وضعیت --shot) و سپس حلقه رویداد."""
