@@ -11,6 +11,7 @@ a = Analysis(
         ('assets/fonts/Vazirmatn-Regular.ttf', 'assets/fonts'),
         ('assets/fonts/Vazirmatn-Medium.ttf', 'assets/fonts'),
         ('assets/fonts/Vazirmatn-Bold.ttf', 'assets/fonts'),
+        ('gd_embedded.json', '.'),
     ],
     hiddenimports=[],
     hookspath=[],

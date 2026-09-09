@@ -18,3 +18,4 @@ desktop.ini
 # --- secrets / local config ---
 *.local
 .env
+gd_embedded.json

@@ -389,13 +389,19 @@ def save_secrets(client_json, refresh_token):
 
 
 def gd_credentials_ready():
-    """اعتبارنامه را در حافظه ثبت و آمادگی را برمی‌گرداند."""
+    """اعتبارنامه را در حافظه ثبت و آمادگی را برمی‌گرداند.
+    اگر فایل محلی (مخصوص همین ویندوز) نبود، از اعتبارنامهٔ جاسازی‌شده استفاده می‌شود
+    تا روی هر ویندوز جدید بدون لاگین کار کند."""
     s = load_settings()
     secrets = load_secrets()
-    if secrets.get("client_json") and secrets.get("refresh_token"):
-        gd_set_credentials(secrets["client_json"], secrets["refresh_token"])
-    ready = bool(secrets.get("client_json") and secrets.get("refresh_token") and s.get("gd_folder_id"))
-    return ready, secrets
+    client = secrets.get("client_json")
+    refresh = secrets.get("refresh_token")
+    if not (client and refresh) and _EMBEDDED_CLIENT_JSON and _EMBEDDED_REFRESH_TOKEN:
+        client, refresh = _EMBEDDED_CLIENT_JSON, _EMBEDDED_REFRESH_TOKEN
+    if client and refresh:
+        gd_set_credentials(client, refresh)
+    ready = bool(client and refresh and (s.get("gd_folder_id") or _EMBEDDED_FOLDER_ID))
+    return ready, {"client_json": client or "", "refresh_token": refresh or ""}
 
 
 # ------------------------------------------------------------
@@ -660,6 +666,32 @@ def build_manifest(run_id_, sources, files, dirs, warnings, parts):
 _GD_AUTH = {"client_json": "", "refresh_token": "", "token": "", "exp": 0.0}
 _GD_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _GD_OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file"
+
+# اعتبارنامهٔ جاسازی‌شده (خواستهٔ کاربر: صفر لاگین روی هر ویندوز جدید).
+# با DPAPI محدود به یک ماشین نیست؛ چون ریپو خصوصی است و scope فقط drive.file
+# (فایل‌های ساختهٔ خود برنامه) است، این مبادله برای ابزار شخصی قابل قبول است.
+# اگر کاربر روزی دسترسی برنامه را در گوگل لغو کند، این مقادیر بی‌اثر می‌شوند و
+# باید دوباره از دیالوگ «اتصال گوگل درایو» وارد شود. فایل gd_embedded.json در
+# سمت بیلد کنار سورس قرار می‌گیرد، داخل EXE جاسازی می‌شود و در ریپو کامیت نمی‌شود.
+_EMBEDDED_CLIENT_JSON = ""
+_EMBEDDED_REFRESH_TOKEN = ""
+_EMBEDDED_FOLDER_ID = ""
+
+try:
+    _emb_path = os.path.join(resource_dir(), "gd_embedded.json")
+    if os.path.isfile(_emb_path):
+        with open(_emb_path, "r", encoding="utf-8") as _f:
+            _emb = json.load(_f)
+        _EMBEDDED_CLIENT_JSON = _emb.get("client_json", "")
+        _EMBEDDED_REFRESH_TOKEN = _emb.get("refresh_token", "")
+        _EMBEDDED_FOLDER_ID = _emb.get("folder_id", "")
+except Exception:
+    pass
+
+
+def gd_get_folder_id():
+    """شناسه پوشهٔ مقصد: از تنظیمات محلی؛ نبود → مقدار جاسازی‌شده."""
+    return load_settings().get("gd_folder_id") or (_EMBEDDED_FOLDER_ID or None)
 
 
 def gd_set_credentials(client_json, refresh_token):
@@ -1083,7 +1115,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
             vss.delete()
         logger.close()
         return 1
-    folder_id = load_settings().get("gd_folder_id")
+    folder_id = gd_get_folder_id()
 
     if rep:
         rep("✓ اعتبارنامه Google Drive آماده است.")
@@ -1187,6 +1219,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
 
     if rep:
         rep("  ✓ شاخص بکاپ آپلود شد")
+    files_map[run_id_ + "_index.json"] = {"file_id": fid_index, "size": os.path.getsize(longpath(index_path))}
 
     # --- ثبت وضعیت محلی (فقط پس از موفقیت کامل) ---
     prev_state = load_gd_state()
@@ -1344,25 +1377,57 @@ def run_restore(parts_dir=None, rep=None):
         if rep:
             rep(f"حالت محلی: بکاپ {run_id_} از {parts_dir} بازیابی می‌شود.")
     else:
-        if rep:
-            rep("خواندن وضعیت آخرین بکاپ Google Drive...")
-        state = load_gd_state()
-        last_index = state.get("last_index") if isinstance(state, dict) else None
-        if not last_index or not last_index.get("run_id"):
-            if rep:
-                rep("هیچ بکاپی روی Drive ثبت نشده (شاخص یافت نشد).")
-            logger.close()
-            return 1
-        run_id_ = last_index["run_id"]
-        if rep:
-            rep("جدیدترین بکاپ: " + run_id_)
-
         ready, _secrets = gd_credentials_ready()
         if not ready:
             if rep:
                 rep("✗ اتصال Google Drive تنظیم نشده است؛ ابتدا از دکمه «اتصال گوگل درایو» حساب خودت را وصل کن.")
             logger.close()
             return 1
+        folder_id = gd_get_folder_id()
+
+        # شاخص بکاپ از خود Drive خوانده می‌شود (نه از فایل محلی) تا بازیابی
+        # روی ویندوز دیگر هم بدون هیچ تنظیم اضافه‌ای کار کند.
+        if rep:
+            rep("خواندن شاخص آخرین بکاپ از Google Drive...")
+        last_index = None
+        try:
+            items = gd_list_folder(folder_id)
+            index_items = sorted(
+                (it for it in items if it["name"].endswith("_index.json")),
+                key=lambda it: it["name"], reverse=True)
+            for it in index_items:
+                try:
+                    ipath = os.path.join(staging, "idx_" + it["name"])
+                    gd_download_file(it["id"], ipath)
+                    with open(ipath, "r", encoding="utf-8") as f:
+                        cand = json.load(f)
+                    os.remove(ipath)
+                    if isinstance(cand, dict) and cand.get("run_id") and \
+                            cand.get("folder_id") == folder_id and isinstance(cand.get("files"), dict):
+                        if last_index is None or cand["run_id"] > last_index["run_id"]:
+                            last_index = cand
+                except Exception:
+                    continue
+        except Exception as ex:
+            if rep:
+                rep("خطا در خواندن پوشهٔ Drive: " + str(ex))
+        if not last_index:
+            if rep:
+                rep("هیچ بکاپ کاملی در پوشهٔ Drive پیدا نشد (شاخص معتبر یافت نشد).")
+            logger.close()
+            return 1
+        # شاخص محلی هم به‌روز می‌شود (برای حذف بکاپ قبلی در بکاپ بعدی همین ماشین)
+        save_gd_state({"last_index": {
+            "run_id": last_index["run_id"],
+            "index_file_id": last_index.get("files", {}).get(last_index["run_id"] + "_index.json", {}).get("file_id", ""),
+            "created_at": last_index.get("created_at", ""),
+            "files": last_index["files"],
+            "total_files": last_index.get("total_files", 0),
+            "total_size": last_index.get("total_size", 0),
+        }})
+        run_id_ = last_index["run_id"]
+        if rep:
+            rep("جدیدترین بکاپ: " + run_id_)
 
         dl_dir = os.path.join(staging, "parts")
         os.makedirs(dl_dir, exist_ok=True)
@@ -2183,9 +2248,17 @@ if _try_sys_imports():
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         data = json.load(f)
+                    # فایل رسمی گوگل: {"installed": {...}} — فیلد type داخل ندارد؛
+                    # کلید بیرونی خودش نشان‌گر نوع است. ساختار مسطح هم پذیرفته می‌شود.
+                    if isinstance(data.get("web"), dict):
+                        self.lbl_result.setText("✗ این فایل کلاینت از نوع Web است؛ در کنسول کلاینت با نوع Desktop app بساز.")
+                        return
+                    if isinstance(data.get("service_account"), dict) or data.get("type") == "service_account":
+                        self.lbl_result.setText("✗ این فایل کلید حساب سرویس است، نه کلاینت OAuth.")
+                        return
                     inner = data.get("installed") if isinstance(data.get("installed"), dict) else data
-                    if inner.get("type") != "installed" or not inner.get("client_id"):
-                        self.lbl_result.setText("✗ این فایل کلاینت OAuth از نوع Desktop app نیست.")
+                    if not inner.get("client_id") or not inner.get("client_secret"):
+                        self.lbl_result.setText("✗ این فایل کلاینت OAuth معتبر نیست (client_id/client_secret ندارد).")
                         return
                     self._client_json = json.dumps(data)
                     self.ed_key.setText(path)
