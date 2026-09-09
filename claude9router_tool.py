@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 
 USER_AGENT = APP_NAME + "/" + APP_VERSION
 
