@@ -1222,41 +1222,55 @@ def run_backup(upload=True, out_dir=None, rep=None):
     files_map[run_id_ + "_index.json"] = {"file_id": fid_index, "size": os.path.getsize(longpath(index_path))}
 
     # --- ثبت وضعیت محلی (فقط پس از موفقیت کامل) ---
+    # سابقهٔ بکاپ‌ها نگه داشته می‌شود (جدید → قدیم) تا نگهداشت ۲ نسخهٔ آخر ممکن باشد
     prev_state = load_gd_state()
-    state = {
-        "last_index": {
-            "run_id": run_id_,
-            "index_file_id": fid_index,
-            "created_at": index["created_at"],
-            "files": files_map,
-            "total_files": index["total_files"],
-            "total_size": index["total_size"],
-        },
-    }
-    save_gd_state(state)
+    history = list(prev_state.get("history") or []) if isinstance(prev_state, dict) else []
+    prev_index = history[0] if history and isinstance(history[0], dict) else None
+    if prev_index is None and isinstance(prev_state, dict) and isinstance(prev_state.get("last_index"), dict):
+        prev_index = prev_state["last_index"]  # سازگاری با state نسخه‌های قبل
+    history.insert(0, {
+        "run_id": run_id_,
+        "index_file_id": fid_index,
+        "created_at": index["created_at"],
+        "files": files_map,
+        "total_files": index["total_files"],
+        "total_size": index["total_size"],
+    })
+    save_gd_state({"history": history})
 
-    # --- حذف بکاپ قبلی از پوشه (پس از ثبت موفق بکاپ جدید) ---
-    prev_index = prev_state.get("last_index") if isinstance(prev_state, dict) else None
-    if prev_index and prev_index.get("run_id") and prev_index["run_id"] != run_id_:
-        old_ids = collect_backup_file_ids(prev_index)
-        old_idx_id = prev_index.get("index_file_id")
-        if old_idx_id:
-            old_ids.append(old_idx_id)
-        if old_ids:
+    # --- حذف بکاپ‌های قدیمی‌تر از ۲ نسخهٔ آخر (مرور خود پوشهٔ Drive) ---
+    # با مرور پوشه، پسماندهای ناقص نسخه‌های قبل هم خودکار پاک می‌شوند.
+    keep = 2
+    try:
+        items = gd_list_folder(folder_id)
+        runs = {}
+        for it in items:
+            mm = re.match(r"^(backup_\d{8}_\d{6})_", it["name"])
+            if mm:
+                runs.setdefault(mm.group(1), []).append(it["id"])
+        kept_runs = set(sorted(runs.keys(), reverse=True)[:keep])
+        old_items = []
+        for rid, ids in runs.items():
+            if rid not in kept_runs:
+                old_items.extend(ids)
+        if old_items:
             if rep:
-                rep("حذف بکاپ قبلی از Google Drive (" + str(len(old_ids)) + " فایل)...")
-            deleted_prev = 0
-            for oid in old_ids:
+                rep("حذف بکاپ‌های قدیمی‌تر از " + str(keep) + " نسخهٔ اخیر (" + str(len(old_items)) + " فایل)...")
+            removed_total = 0
+            for oid in old_items:
                 try:
                     gd_delete_file(oid)
-                    deleted_prev += 1
+                    removed_total += 1
                 except Exception as ex:
                     if rep:
                         rep("  حذف " + str(oid)[:16] + "… ناموفق: " + str(ex)[:100])
             if rep:
-                rep("  🗑 " + str(deleted_prev) + " فایل بکاپ قبلی حذف شد.")
+                rep("  🗑 " + str(removed_total) + " فایل قدیمی حذف شد؛ " + str(keep) + " نسخهٔ اخیر باقی ماند.")
+    except Exception as ex:
+        if rep:
+            rep("  ⚠ مرور پوشه برای حذف بکاپ‌های قدیمی ناموفق بود (در بکاپ بعدی دوباره تلاش می‌شود): " + str(ex)[:120])
     if rep:
-        rep("بکاپ کامل شد و به Google Drive آپلود گردید (فقط آخرین بکاپ در پوشه می‌ماند).")
+        rep("بکاپ کامل شد و به Google Drive آپلود گردید (۲ نسخهٔ اخیر در پوشه می‌مانند).")
     if vss:
         vss.delete()
     logger.close()
@@ -2001,7 +2015,7 @@ if _try_sys_imports():
             self.btn_exit = QPushButton("خروج")
             self.btn_exit.setObjectName("btnExit")
 
-            hint = QLabel("بکاپ به Google Drive آپلود می‌شود و فقط آخرین بکاپ در پوشه می‌ماند. پس از بازگردانی، نصب‌کننده Claude اجرا و npm جهانی بازنصب می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
+            hint = QLabel("بکاپ به Google Drive آپلود می‌شود؛ ۲ نسخهٔ اخیر در پوشه می‌ماند و قدیمی‌ترها خودکار حذف می‌شوند. پس از بازگردانی، نصب‌کننده Claude اجرا و npm جهانی بازنصب می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
             hint.setObjectName("appSub")
             hint.setWordWrap(True)
 
