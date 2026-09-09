@@ -2,19 +2,19 @@
 # ============================================================
 #  ابزار بکاپ/بازیابی Claude و 9router — ویندوز
 #  خروجی نهایی: EXE مستقل (PyInstaller) با GUI شیشه‌ای (PySide6)
-#  سرویس: ربات تلگرام — بکاپ مستقیماً به چت تلگرامی کاربر ارسال می‌شود
-#    Bot API؛ هر اجزا ≤۱۹MB (تحت سقف ۲۰MB دانلود ربات) پس ارسال و بازیابی
-#    خودکار حتی برای بکاپ‌های چند گیگابایتی ممکن است
+#  سرویس: Google Drive (حساب سرویس + پوشه اشتراکی در Drive کاربر)
+#    هر جزء بکاپ (زیپ/تکه/مانیفست/لاگ/شاخص) به‌صورت فایل در پوشه پشتیبان ذخیره می‌شود
+#    بازیابی با دانلود اجزای ثبت‌شده در شاخص انجام می‌شود
 #  بکاپ سه مسیر پیش‌فرض:
 #    AppData\Local\Claude-3p
 #    AppData\Roaming\9router
 #    %USERPROFILE%\.claude
 #  + مسیرهای سفارشی (پوشه/فایل) انتخابی کاربر: %LOCALAPPDATA%\Claude9RouterTool\custom_paths.json
-#  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۱۹MB شکسته می‌شود
-#  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← ارسال بکاپ جدید به تلگرام ←
-#           پس از موفقیت کامل، پیام‌های بکاپ قبلی حذف می‌شوند (فقط آخرین بکاپ در چت می‌ماند)
+#  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۹۸MB شکسته می‌شود
+#  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← آپلود اجزای جدید به Drive ←
+#           پس از موفقیت کامل، فایل‌های بکاپ قبلی پوشه حذف می‌شوند (فقط آخرین بکاپ می‌ماند)
 #  فایل‌های بازِ در حال استفاده با Snapshot (VSS) خوانده می‌شوند؛ فاصله بکاپ خودکار قابل تنظیم است
-#  توکن ربات با DPAPI ویندوز (متناسب با کاربر) رمزنگاری و در secrets.dat ذخیره می‌شود
+#  کلید حساب سرویس با DPAPI ویندوز (متناسب با کاربر) رمزنگاری و ذخیره می‌شود
 # ============================================================
 
 import base64
@@ -34,21 +34,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
 import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 
 USER_AGENT = APP_NAME + "/" + APP_VERSION
 
-TG_API_BASE = "https://api.telegram.org"
-
-PART_TARGET = 19 * 1024 * 1024          # حداکثر حجم محتوای هر بخش زیپ (۱۹MB — زیر سقف ۲۰MB دانلود ربات)
+# --- Google Drive ---
+GD_DRIVE_API = "https://www.googleapis.com/drive/v3"
+GD_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+GD_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GD_SCOPE = "https://www.googleapis.com/auth/drive"
+GD_CHUNK = 8 * 1024 * 1024              # حجم تکه در آپلود resumable
+PART_TARGET = 98 * 1024 * 1024          # حداکثر حجم محتوای هر بخش زیپ (۹۸MB)
 CHUNK_THRESHOLD = 100 * 1024 * 1024     # فایل تکی بزرگ‌تر از این به تکه‌های خام شکسته می‌شود
-CHUNK_SIZE = 19 * 1024 * 1024           # حجم هر تکه برای فایل‌های بزرگ
-TG_SEND_LIMIT = 50 * 1024 * 1024        # سقف ارسال Bot API
-TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024    # سقف دانلود Bot API (اجزای بکاپ با حاشیه امن زیر آن‌اند)
+CHUNK_SIZE = 98 * 1024 * 1024           # حجم هر تکه برای فایل‌های بزرگ
 
 SKIP_SUFFIXES = (".lock", ".tmp", ".part")
 SKIP_FILENAMES = {"SingletonCookie", "SingletonLock", "SingletonSocket"}
@@ -353,36 +357,45 @@ class CryptProtect:
 
 
 # ------------------------------------------------------------
-#  تنظیمات تلگرام
-#    settings.json: tg_chat_id، tg_last_backup (وضعیت آخرین بکاپ ارسالی)
-#    secrets.dat:   توکن ربات با DPAPI ویندوز رمزنگاری‌شده
+#  اتصال Google Drive (OAuth حساب خود کاربر)
+#    settings.json: gd_folder_id (شناسه پوشهٔ مقصد)
+#    secrets.dat:   client_json (OAuth Client) + refresh_token با DPAPI رمزنگاری‌شده
 # ------------------------------------------------------------
 
 SECRETS_PATH = os.path.join(localappdata(), APP_NAME, "secrets.dat")
 
 
 def load_secrets():
+    """اعتبارنامه ذخیره‌شده — یا مقادیر خالی."""
     try:
         with open(longpath(SECRETS_PATH), "r", encoding="utf-8") as f:
             enc = json.load(f)
-        return {"token": CryptProtect.unprotect(enc["token_b64"]) if enc.get("token_b64") else ""}
+        return {
+            "client_json": CryptProtect.unprotect(enc["client_b64"]) if enc.get("client_b64") else "",
+            "refresh_token": CryptProtect.unprotect(enc["refresh_b64"]) if enc.get("refresh_b64") else "",
+        }
     except Exception:
-        return {"token": ""}
+        return {"client_json": "", "refresh_token": ""}
 
 
-def save_secrets(token):
-    enc = {"token_b64": CryptProtect.protect(token) if token else ""}
+def save_secrets(client_json, refresh_token):
+    enc = {
+        "client_b64": CryptProtect.protect(client_json) if client_json else "",
+        "refresh_b64": CryptProtect.protect(refresh_token) if refresh_token else "",
+    }
     os.makedirs(os.path.dirname(longpath(SECRETS_PATH)), exist_ok=True)
     with open(longpath(SECRETS_PATH), "w", encoding="utf-8") as f:
         json.dump(enc, f, indent=1)
 
 
-def tg_credentials_ready():
+def gd_credentials_ready():
+    """اعتبارنامه را در حافظه ثبت و آمادگی را برمی‌گرداند."""
     s = load_settings()
     secrets = load_secrets()
-    if not secrets.get("token") or not s.get("tg_chat_id"):
-        return False, secrets
-    return True, secrets
+    if secrets.get("client_json") and secrets.get("refresh_token"):
+        gd_set_credentials(secrets["client_json"], secrets["refresh_token"])
+    ready = bool(secrets.get("client_json") and secrets.get("refresh_token") and s.get("gd_folder_id"))
+    return ready, secrets
 
 
 # ------------------------------------------------------------
@@ -631,199 +644,292 @@ def build_manifest(run_id_, sources, files, dirs, warnings, parts):
 
 
 # ------------------------------------------------------------
-#  ارتباط با تلگرام (Bot API)
-#  هر جزء بکاپ (زیپ/تکه/مانیفست/لاگ) به‌صورت Document به چت کاربر ارسال و
-#  file_id آن در «شاخص بکاپ» ثبت می‌شود؛ بازیابی با دانلود file_id انجام می‌شود.
+#  ارتباط با Google Drive (حساب سرویس + REST ساده)
+#  هر جزء بکاپ (زیپ/تکه/مانیفست/لاگ) فایلی در پوشهٔ مقصد است؛
+#  شاخص بکاپ (backup_index.json) نگاشت نام جزء به شناسه فایل Drive را نگه می‌دارد.
 # ------------------------------------------------------------
 
-def tg_request(token, method, params=None, timeout=60):
-    """فراخوانی متد Bot API با فرم urlencode؛ پاسخ JSON برمی‌گردد.
-    محدودیت نرخ (HTTP 429) با انتظار مطابق Retry-After به‌صورت خودکار مدیریت می‌شود."""
-    url = TG_API_BASE + "/bot" + token + "/" + method
-    data = urllib.parse.urlencode(params or {}).encode("utf-8")
-    last_ex = None
-    for _attempt in range(5):
-        req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as ex:
-            if ex.code == 429:
-                try:
-                    wait = int(ex.headers.get("Retry-After", "3"))
-                except (TypeError, ValueError):
-                    wait = 3
-                time.sleep(min(wait + 1, 35))
-                last_ex = ex
-                continue
-            raise
-    raise last_ex or RuntimeError("فراخوانی تلگرام ناموفق بود")
+# ------------------------------------------------------------
+#  احراز هویت Google Drive با OAuth2 حساب خود کاربر — پایتون خالص
+#  (حساب سرویس سهمیهٔ فضای ندارد؛ با OAuth فایل‌ها مالکیت حساب خود کاربر
+#   هستند و از ۱۵GB او کم می‌شوند. scope محدود drive.file: برنامه فقط به
+#   فایل‌هایی که خودش می‌سازد دسترسی دارد — بدون نیاز به تأییدیهٔ گوگل)
+#  Refresh Token با DPAPI رمزنگاری و ذخیره می‌شود؛ منقضی نمی‌شود.
+# ------------------------------------------------------------
+
+_GD_AUTH = {"client_json": "", "refresh_token": "", "token": "", "exp": 0.0}
+_GD_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GD_OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 
-def tg_test_connection(token, chat_id=None):
-    """getMe و در صورت وجود chat_id، getChat — برمی‌گرداند (ok, پیام)."""
+def gd_set_credentials(client_json, refresh_token):
+    """ثبت اعتبارنامه در حافظه (بعد از خواندن از secrets.dat)."""
+    _GD_AUTH.update({
+        "client_json": client_json or "",
+        "refresh_token": refresh_token or "",
+        "token": "", "exp": 0.0,
+    })
+
+
+def _gd_client_info(client_json):
+    """خواندن فیلدهای کلاینت؛ ساختار {installed: {...}} یا مسطح هر دو پذیرفته می‌شود."""
+    client = json.loads(client_json)
+    if "installed" in client and isinstance(client["installed"], dict):
+        client = client["installed"]
+    return client
+
+
+def gd_get_access_token():
+    """دریافت access token با Refresh Token (خودکار و بی‌صدا)."""
+    now = time.time()
+    if _GD_AUTH["token"] and now < _GD_AUTH["exp"] - 60:
+        return _GD_AUTH["token"]
+    if not _GD_AUTH["client_json"] or not _GD_AUTH["refresh_token"]:
+        raise RuntimeError("اعتبارنامه گوگل تنظیم نشده است")
+    client = _gd_client_info(_GD_AUTH["client_json"])
+    data = urllib.parse.urlencode({
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "refresh_token": _GD_AUTH["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = urllib.request.Request(GD_TOKEN_URL, data=data, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        res = json.loads(r.read().decode("utf-8"))
+    if "access_token" not in res:
+        raise RuntimeError("دریافت توکن گوگل ناموفق: " + str(res)[:200])
+    _GD_AUTH["token"] = res["access_token"]
+    _GD_AUTH["exp"] = now + float(res.get("expires_in", 3600))
+    return _GD_AUTH["token"]
+
+
+def gd_authorize_interactive(client_json, rep=None):
+    """جریان OAuth مرورگری: سرور محلی موقت + باز شدن مرورگر برای تأیید کاربر.
+    Refresh Token را برمی‌گرداند (و اعتبارنامه را در حافظه ثبت می‌کند)."""
+    client = _gd_client_info(client_json)
+
+    class _Handler(BaseHTTPRequestHandler):
+        code = None
+        error = None
+
+        def do_GET(self):
+            q = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(q.query)
+            if "code" in params:
+                _Handler.code = params["code"][0]
+                body = ("<html><body dir=rtl style='font-family:sans-serif;text-align:center;padding-top:60px'>"
+                        "<h2>✓ تأیید شد</h2><p>می‌توانی این تب را ببندی و به برنامه برگردی.</p></body></html>").encode("utf-8")
+            else:
+                _Handler.error = params.get("error", ["unknown"])[0]
+                body = ("<html><body dir=rtl style='font-family:sans-serif;text-align:center;padding-top:60px'>"
+                        "<h2>✗ تأیید نشد</h2></body></html>").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    srv.timeout = 300
+    port = srv.server_address[1]
+    # کلاینت از نوع Desktop app: گوگل هر پورت loopback را می‌پذیرد (URI ثبت‌شده لازم نیست)
+    redirect_uri = "http://127.0.0.1:" + str(port)
+    state = uuid.uuid4().hex
+    auth_url = (_GD_OAUTH_AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client["client_id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": _GD_OAUTH_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }))
+    if rep:
+        rep("مرورگر برای تأیید دسترسی باز می‌شود...")
+    webbrowser.open(auth_url)
+
+    deadline = time.time() + 300
+    while _Handler.code is None and _Handler.error is None and time.time() < deadline:
+        srv.handle_request()
+    srv.server_close()
+    if _Handler.error or not _Handler.code:
+        raise RuntimeError("تأیید گوگل انجام نشد: " + str(_Handler.error or "مهلت تمام شد"))
+
+    data = urllib.parse.urlencode({
+        "code": _Handler.code,
+        "client_id": client["client_id"],
+        "client_secret": client["client_secret"],
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+    req = urllib.request.Request(GD_TOKEN_URL, data=data, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        res = json.loads(r.read().decode("utf-8"))
+    refresh = res.get("refresh_token", "")
+    if not refresh:
+        raise RuntimeError("Refresh Token دریافت نشد؛ دوباره تلاش کن (گوگل هر بار با prompt=consent آن را می‌دهد).")
+    gd_set_credentials(client_json, refresh)
+    return refresh
+
+
+def gd_request(method, url, params=None, data=None, headers=None, timeout=120):
+    """فراخوانی REST به Drive با توکن حساب کاربر (از حافظه)."""
+    if params:
+        url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    tok = gd_get_access_token()
+    h = {"Authorization": "Bearer " + tok, "User-Agent": USER_AGENT}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read()
+    return json.loads(body.decode("utf-8")) if body else {}
+
+
+def gd_test_connection(client_json=None, refresh_token=None):
+    """آزمون اتصال: Refresh Token در حافظه ثبت و دربارهٔ حساب پرسیده می‌شود."""
     try:
-        me = tg_request(token, "getMe")
-        if not me.get("ok"):
-            return False, "پاسخ نامعتبر از تلگرام"
-        name = "@" + me["result"].get("username", "?")
-        if chat_id:
-            chat = tg_request(token, "getChat", {"chat_id": str(chat_id)})
-            if not chat.get("ok"):
-                return False, "ربات " + name + " وصل شد ولی chat_id نامعتبر است: " + str(chat.get("description", ""))
-            cinfo = chat["result"]
-            ctitle = cinfo.get("username") or cinfo.get("first_name") or str(chat_id)
-            return True, "✓ ربات " + name + " به چت «" + ctitle + "» وصل است"
-        return True, "✓ ربات " + name + " معتبر است (chat_id داده نشد)"
+        if client_json and refresh_token:
+            gd_set_credentials(client_json, refresh_token)
+        tok = gd_get_access_token()
+        req = urllib.request.Request(
+            GD_DRIVE_API + "/about?fields=user",
+            headers={"Authorization": "Bearer " + tok, "User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            about = json.loads(r.read().decode("utf-8"))
+        email = about.get("user", {}).get("emailAddress", "?")
+        return True, "✓ به حساب Google «" + email + "» وصل است"
     except urllib.error.HTTPError as ex:
         try:
-            desc = json.loads(ex.read().decode("utf-8")).get("description", "")
+            detail = json.loads(ex.read().decode("utf-8")).get("error", {}).get("message", "")
         except Exception:
-            desc = str(ex)
-        return False, "خطا: " + desc
+            detail = str(ex)
+        return False, "خطا: " + (detail or str(ex))
     except Exception as ex:
         return False, "خطا: " + str(ex)
 
 
-def tg_detect_chat_id(token):
-    """آخرین فرستندهٔ پیام به ربات را از getUpdates می‌خواند؛ (chat_id, نام) برمی‌گرداند.
-    کاربر باید یکبار به ربات پیام بدهد (مثلاً /start)."""
-    upd = tg_request(token, "getUpdates", {"limit": 100})
-    if not upd.get("ok"):
-        raise RuntimeError("getUpdates ناموفق: " + str(upd)[:200])
-    best = None
-    for u in upd.get("result", []):
-        msg = u.get("message") or u.get("edited_message") or u.get("channel_post")
-        if not msg:
-            continue
-        chat = msg.get("chat", {})
-        date = msg.get("date", 0)
-        if chat.get("id") is not None and (best is None or date > best[0]):
-            best = (date, chat["id"], chat.get("username") or chat.get("first_name") or "")
-    if not best:
-        raise RuntimeError("هیچ پیامی به ربات نرسیده؛ ابتدا در تلگرام به ربات پیام بده (مثلاً /start)")
-    return best[1], best[2]
-
-
-def tg_send_document(token, chat_id, path, caption=None, timeout=900):
-    """ارسال فایل به‌صورت Document؛ (message_id, file_id) برمی‌گرداند."""
-    with open(longpath(path), "rb") as f:
-        data = f.read()
+def gd_upload_file(folder_id, path, timeout=1800):
+    """آپلود فایل به پوشهٔ مقصد (multipart ساده؛ برای اجزای ≤۹۸MB کافی است).
+    (file_id, name, size) برمی‌گرداند."""
+    size = os.path.getsize(longpath(path))
+    metadata = {"name": os.path.basename(path), "parents": [folder_id]}
     boundary = "----c9rbnd" + uuid.uuid4().hex
-    fname = os.path.basename(path).replace('"', "")
-    chunks = []
-    chunks.append(("--" + boundary + "\r\n"
-                   "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
-                   + str(chat_id) + "\r\n").encode("utf-8"))
-    if caption:
-        chunks.append(("--" + boundary + "\r\n"
-                       "Content-Disposition: form-data; name=\"caption\"\r\n\r\n"
-                       + caption[:1024] + "\r\n").encode("utf-8"))
-    chunks.append(("--" + boundary + "\r\n"
-                   "Content-Disposition: form-data; name=\"document\"; filename=\""
-                   + fname + "\"\r\n"
-                   "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8"))
-    body = b"".join(chunks) + data + ("\r\n--" + boundary + "--\r\n").encode("utf-8")
-    req = urllib.request.Request(
-        TG_API_BASE + "/bot" + token + "/sendDocument", data=body, method="POST",
-        headers={
-            "Content-Type": "multipart/form-data; boundary=" + boundary,
-            "User-Agent": USER_AGENT,
-        },
-    )
+    meta_part = ("--" + boundary + "\r\n"
+                 "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                 + json.dumps(metadata) + "\r\n"
+                 "--" + boundary + "\r\n"
+                 "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+    tail = ("\r\n--" + boundary + "--\r\n").encode("utf-8")
+    with open(longpath(path), "rb") as f:
+        body = meta_part + f.read() + tail
+    url = GD_UPLOAD_API + "/files?uploadType=multipart&fields=id,name,size"
+    tok = gd_get_access_token()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": "Bearer " + tok,
+        "Content-Type": "multipart/related; boundary=" + boundary,
+        "User-Agent": USER_AGENT,
+    })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         res = json.loads(r.read().decode("utf-8"))
-    if not res.get("ok"):
-        raise RuntimeError("ارسال ناموفق: " + str(res)[:200])
-    msg = res["result"]
-    doc = msg.get("document") or {}
-    return msg["message_id"], doc.get("file_id", "")
+    return res["id"], res.get("name", ""), size
 
 
-def tg_download_document(token, file_id, dest, timeout=900):
-    """دانلود Document با getFile و ذخیرهٔ استریمی در dest."""
-    info = tg_request(token, "getFile", {"file_id": file_id}, timeout=120)
-    if not info.get("ok"):
-        raise RuntimeError("getFile ناموفق: " + str(info)[:200])
-    fp = info["result"]["file_path"]
-    url = TG_API_BASE + "/file/bot" + token + "/" + urllib.parse.quote(fp, safe="")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def gd_download_file(file_id, dest, timeout=1800):
+    """دانلود فایل Drive با alt=media و ذخیرهٔ استریمی."""
+    tok = gd_get_access_token()
+    url = GD_DRIVE_API + "/files/" + urllib.parse.quote(file_id, safe="") + "?alt=media"
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok, "User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as r, open(longpath(dest), "wb") as f:
         shutil.copyfileobj(r, f, 1024 * 256)
 
 
-def tg_delete_messages(token, chat_id, message_ids, rep=None):
-    """حذف پیام‌های چت (پاک‌سازی بکاپ قبلی). تعداد حذف‌شدهٔ موفق برمی‌گردد."""
-    ok = 0
-    for mid in message_ids:
-        try:
-            tg_request(token, "deleteMessage", {"chat_id": str(chat_id), "message_id": str(mid)})
-            ok += 1
-        except Exception as ex:
-            if rep:
-                rep("  حذف پیام " + str(mid) + " ناموفق: " + str(ex)[:120])
-        time.sleep(0.15)  # محدودیت نرخ تلگرام
-    return ok
-
-
-# ------------------------------------------------------------
-#  وضعیت تلگرام (tg_state.json — شاخص آخرین بکاپ + پیام‌های نیمه‌کاره)
-# ------------------------------------------------------------
-
-def tg_state_path():
-    return os.path.join(localappdata(), APP_NAME, "tg_state.json")
-
-
-def load_tg_state():
+def gd_delete_file(file_id):
+    """حذف فایل از Drive (idempotent — خطای 404 نادیده گرفته می‌شود)."""
+    tok = gd_get_access_token()
+    url = GD_DRIVE_API + "/files/" + urllib.parse.quote(file_id, safe="")
+    req = urllib.request.Request(url, method="DELETE", headers={"Authorization": "Bearer " + tok, "User-Agent": USER_AGENT})
     try:
-        with open(longpath(tg_state_path()), "r", encoding="utf-8") as f:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            r.read()
+    except urllib.error.HTTPError as ex:
+        if ex.code != 404:
+            raise
+
+
+def gd_list_folder(folder_id):
+    """فهرست فایل‌های پوشهٔ مقصد؛ لیستی از {id, name, size}."""
+    items = []
+    page_token = None
+    while True:
+        params = {"q": "'" + folder_id + "' in parents and trashed = false",
+                  "fields": "nextPageToken, files(id,name,size)",
+                  "pageSize": "1000"}
+        if page_token:
+            params["pageToken"] = page_token
+        res = gd_request("GET", GD_DRIVE_API + "/files", params=params)
+        for it in res.get("files", []):
+            try:
+                sz = int(it.get("size") or 0)
+            except (TypeError, ValueError):
+                sz = 0
+            items.append({"id": it["id"], "name": it.get("name", ""), "size": sz})
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+# ------------------------------------------------------------
+#  وضعیت Drive (gd_state.json — شاخص آخرین بکاپ برای حذف/بازیابی)
+# ------------------------------------------------------------
+
+def gd_state_path():
+    return os.path.join(localappdata(), APP_NAME, "gd_state.json")
+
+
+def load_gd_state():
+    try:
+        with open(longpath(gd_state_path()), "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def save_tg_state(state):
+def save_gd_state(state):
     try:
-        os.makedirs(os.path.dirname(longpath(tg_state_path())), exist_ok=True)
-        with open(longpath(tg_state_path()), "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(longpath(gd_state_path())), exist_ok=True)
+        with open(longpath(gd_state_path()), "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
 
 
-def build_backup_index(run_id_, chat_id, files_map, manifest_entry, log_entry, total_files, total_size):
-    """شاخص بکاپ: نگاشت نام جزء به file_id تلگرام (بازیابی) + شناسه پیام‌ها (حذف بکاپ قبلی)."""
+def build_backup_index(run_id_, folder_id, files_map, total_files, total_size):
+    """شاخص بکاپ: نگاشت نام جزء به شناسه فایل Drive (برای بازیابی و حذف بکاپ قبلی)."""
     return {
         "schema_version": 1,
         "tool": APP_NAME + " v" + APP_VERSION,
         "run_id": run_id_,
         "created_at": now_iso(),
-        "chat_id": str(chat_id),
-        "files": files_map,          # {نام جزء: {file_id, message_id, size}}
-        "manifest": manifest_entry,  # {name, file_id, message_id, size}
-        "log": log_entry,
+        "folder_id": folder_id,
+        "files": files_map,   # {نام جزء: {file_id, size}}
         "total_files": total_files,
         "total_size": total_size,
     }
 
 
-def collect_backup_messages(last_index):
-    """همه شناسه پیام‌های یک بکاپ (اجزا + شاخص) را برمی‌گرداند."""
-    msgs = []
+def collect_backup_file_ids(last_index):
+    """همه شناسه فایل‌های Drive یک بکاپ را برمی‌گرداند."""
+    ids = []
     for entry in (last_index.get("files") or {}).values():
-        mid = entry.get("message_id")
-        if isinstance(mid, int) and mid > 0:
-            msgs.append(mid)
-    for entry in (last_index.get("manifest"), last_index.get("log")):
-        if isinstance(entry, dict):
-            mid = entry.get("message_id")
-            if isinstance(mid, int) and mid > 0:
-                msgs.append(mid)
-    mid = last_index.get("index_message_id")
-    if isinstance(mid, int) and mid > 0:
-        msgs.append(mid)
-    return msgs
+        fid = entry.get("file_id")
+        if fid:
+            ids.append(fid)
+    return ids
 
 
 def extract_zip_safe(path, dest_dir):
@@ -949,7 +1055,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
         logger.close()
         return 0
 
-    # --- اعتبارسنجی بکاپ محلی (پیش از هر تماس با تلگرام) ---
+    # --- اعتبارسنجی بکاپ محلی (پیش از هر تماس با Drive) ---
     uploads = [(name, path, sz) for (name, path, _cnt, sz) in archives] + list(chunk_artifacts)
     verify = list(uploads) + [
         (run_id_ + "_manifest.json", manifest_path, 0),
@@ -960,46 +1066,43 @@ def run_backup(upload=True, out_dir=None, rep=None):
         if rep:
             for mname in missing:
                 rep("  ✗ جزء محلی یافت نشد: " + mname)
-            rep("بکاپ محلی ناقص است؛ بکاپ قبلی تلگرام دست‌نخورده ماند.")
+            rep("بکاپ محلی ناقص است؛ بکاپ قبلی Drive دست‌نخورده ماند.")
         if vss:
             vss.delete()
         logger.close()
         return 1
     if rep:
-        rep("✓ بکاپ محلی کامل و سالم است (" + str(len(verify)) + " جزء)؛ آماده ارسال به تلگرام.")
+        rep("✓ بکاپ محلی کامل و سالم است (" + str(len(verify)) + " جزء)؛ آماده آپلود به Google Drive.")
 
-    # --- اعتبارنامه تلگرام ---
-    ready, secrets = tg_credentials_ready()
+    # --- اعتبارنامه Google Drive ---
+    ready, _secrets = gd_credentials_ready()
     if not ready:
         if rep:
-            rep("✗ اتصال تلگرام تنظیم نشده است؛ ابتدا توکن ربات و chat_id را از دکمه «اتصال تلگرام» وارد کن.")
+            rep("✗ اتصال Google Drive تنظیم نشده است؛ ابتدا از دکمه «اتصال گوگل درایو» حساب خودت را وصل کن.")
         if vss:
             vss.delete()
         logger.close()
         return 1
-    token = secrets["token"]
-    chat_id = load_settings().get("tg_chat_id")
+    folder_id = load_settings().get("gd_folder_id")
 
     if rep:
-        rep("✓ اتصال تلگرام بررسی شد.")
+        rep("✓ اعتبارنامه Google Drive آماده است.")
 
-    # --- ارسال اجزای بکاپ به تلگرام (بکاپ قبلی هنوز دست‌نخورده) ---
+    # --- آپلود اجزای بکاپ به Drive (بکاپ قبلی هنوز دست‌نخورده) ---
     if rep:
-        rep("ارسال بکاپ جدید به تلگرام...")
+        rep("آپلود بکاپ جدید به Google Drive...")
     all_ok = True
-    files_map = {}      # نام جزء → {file_id, message_id, size}
-    sent_messages = []  # همه پیام‌های این بکاپ (شاخص + لاگ) برای ثبت در state
-    caption = "🗄 Claude9RouterTool — بکاپ " + run_id_
+    files_map = {}  # نام جزء → {file_id, size}
+    uploaded_ids = []
     for name, path, sz in uploads:
         ok_part = False
         for attempt in range(1, 4):
             try:
                 if rep:
-                    rep("  ارسال " + name + " (" + format_bytes(sz) + ") — تلاش " + str(attempt))
-                mid, fid = tg_send_document(token, chat_id, path,
-                                            caption=caption if name.endswith(".zip") else None)
-                files_map[name] = {"file_id": fid, "message_id": mid, "size": sz}
-                sent_messages.append(mid)
+                    rep("  آپلود " + name + " (" + format_bytes(sz) + ") — تلاش " + str(attempt))
+                fid, _fn, _fs = gd_upload_file(folder_id, path)
+                files_map[name] = {"file_id": fid, "size": sz}
+                uploaded_ids.append(fid)
                 if rep:
                     rep("  ✓ " + name)
                 ok_part = True
@@ -1011,49 +1114,46 @@ def run_backup(upload=True, out_dir=None, rep=None):
                     time.sleep(2 * attempt)
         if not ok_part:
             if rep:
-                rep("  ✗ ارسال " + name + " ناموفق بود")
+                rep("  ✗ آپلود " + name + " ناموفق بود")
             all_ok = False
 
-    if not all_ok:
-        if rep:
-            rep("برخی اجزا ارسال نشدند؛ شاخص آپلود نمی‌شود تا بکاپ ناقص بازیابی نشود و بکاپ قبلی حفظ می‌ماند.")
-        # پاک‌سازی اجزای نیمه‌کاره (تا چت شلوغ نشود) و ثبت آن‌ها برای حذف در اجرای بعدی
-        if sent_messages:
-            deleted_orphan = tg_delete_messages(token, chat_id, sent_messages, rep=rep)
-            if rep:
-                rep("  " + str(deleted_orphan) + " پیام نیمه‌کاره پاک شد.")
-        if vss:
-            vss.delete()
-        logger.close()
-        return 1
-
-    # --- ارسال مانیفست و لاگ (بازیابی به مانیفست نیاز دارد) ---
+    # --- آپلود مانیفست و لاگ (بازیابی به مانیفست نیاز دارد) ---
     for key, path in ((run_id_ + "_manifest.json", manifest_path),
                       (run_id_ + "_log.txt", log_path)):
+        if not all_ok:
+            break
         try:
-            mid, fid = tg_send_document(token, chat_id, path)
-            files_map[key] = {"file_id": fid, "message_id": mid,
-                              "size": os.path.getsize(longpath(path))}
-            sent_messages.append(mid)
+            fid, _fn, _fs = gd_upload_file(folder_id, path)
+            files_map[key] = {"file_id": fid, "size": os.path.getsize(longpath(path))}
+            uploaded_ids.append(fid)
             if rep:
                 rep("  ✓ " + key)
         except Exception as ex:
             if rep:
-                rep("  ✗ ارسال " + key + " ناموفق: " + str(ex))
+                rep("  ✗ آپلود " + key + " ناموفق: " + str(ex))
             all_ok = False
+
     if not all_ok:
-        tg_delete_messages(token, chat_id, sent_messages, rep=rep)
         if rep:
-            rep("  پیام‌های نیمه‌کاره پاک شدند؛ بکاپ قبلی حفظ ماند.")
+            rep("برخی اجزا آپلود نشدند؛ شاخص ساخته نمی‌شود تا بکاپ ناقص بازیابی نشود و بکاپ قبلی حفظ می‌ماند.")
+        # پاک‌سازی اجزای نیمه‌کاره از پوشه (تا شلوغ نشود)
+        if uploaded_ids:
+            cleaned = 0
+            for fid in uploaded_ids:
+                try:
+                    gd_delete_file(fid)
+                    cleaned += 1
+                except Exception:
+                    pass
+            if rep:
+                rep("  " + str(cleaned) + " جزء نیمه‌کاره از Drive پاک شد.")
         if vss:
             vss.delete()
         logger.close()
         return 1
 
-    # --- ارسال شاخص بکاپ (آخرین گام؛ فقط پس از موفقیت همه اجزا) ---
-    index = build_backup_index(run_id_, chat_id, files_map,
-                               files_map.get(run_id_ + "_manifest.json", {}),
-                               files_map.get(run_id_ + "_log.txt", {}),
+    # --- آپلود شاخص بکاپ (آخرین گام؛ فقط پس از موفقیت همه اجزا) ---
+    index = build_backup_index(run_id_, folder_id, files_map,
                                sum(1 for e in files if e.get("status", "ok") == "ok"),
                                sum(e["size"] for e in files))
     index_path = os.path.join(out_dir, run_id_ + "_index.json")
@@ -1069,51 +1169,61 @@ def run_backup(upload=True, out_dir=None, rep=None):
         return 1
 
     try:
-        mid, fid = tg_send_document(token, chat_id, index_path,
-                                    caption="📋 شاخص بکاپ " + run_id_)
+        fid_index, _fn, _fs = gd_upload_file(folder_id, index_path)
     except Exception as ex:
         if rep:
-            rep("  ✗ ارسال شاخص ناموفق: " + str(ex))
-        tg_delete_messages(token, chat_id, sent_messages, rep=rep)
+            rep("  ✗ آپلود شاخص ناموفق: " + str(ex))
+        for fid in uploaded_ids:
+            try:
+                gd_delete_file(fid)
+            except Exception:
+                pass
         if rep:
-            rep("  پیام‌های نیمه‌کاره پاک شدند.")
+            rep("  اجزای نیمه‌کاره پاک شدند.")
         if vss:
             vss.delete()
         logger.close()
         return 1
 
-    sent_messages.append(mid)
     if rep:
-        rep("  ✓ شاخص بکاپ ارسال شد")
+        rep("  ✓ شاخص بکاپ آپلود شد")
 
     # --- ثبت وضعیت محلی (فقط پس از موفقیت کامل) ---
-    prev_state = load_tg_state()
+    prev_state = load_gd_state()
     state = {
         "last_index": {
             "run_id": run_id_,
-            "index_file_id": fid,
-            "index_message_id": mid,
+            "index_file_id": fid_index,
             "created_at": index["created_at"],
             "files": files_map,
             "total_files": index["total_files"],
             "total_size": index["total_size"],
         },
-        "orphan_message_ids": [],
     }
-    save_tg_state(state)
+    save_gd_state(state)
 
-    # --- حذف بکاپ قبلی (پس از ثبت موفق بکاپ جدید) ---
+    # --- حذف بکاپ قبلی از پوشه (پس از ثبت موفق بکاپ جدید) ---
     prev_index = prev_state.get("last_index") if isinstance(prev_state, dict) else None
     if prev_index and prev_index.get("run_id") and prev_index["run_id"] != run_id_:
-        old_msgs = collect_backup_messages(prev_index)
-        if old_msgs:
+        old_ids = collect_backup_file_ids(prev_index)
+        old_idx_id = prev_index.get("index_file_id")
+        if old_idx_id:
+            old_ids.append(old_idx_id)
+        if old_ids:
             if rep:
-                rep("حذف بکاپ قبلی از تلگرام (" + str(len(old_msgs)) + " پیام)...")
-            deleted_prev = tg_delete_messages(token, chat_id, old_msgs, rep=rep)
+                rep("حذف بکاپ قبلی از Google Drive (" + str(len(old_ids)) + " فایل)...")
+            deleted_prev = 0
+            for oid in old_ids:
+                try:
+                    gd_delete_file(oid)
+                    deleted_prev += 1
+                except Exception as ex:
+                    if rep:
+                        rep("  حذف " + str(oid)[:16] + "… ناموفق: " + str(ex)[:100])
             if rep:
-                rep("  🗑 " + str(deleted_prev) + " پیام بکاپ قبلی حذف شد.")
+                rep("  🗑 " + str(deleted_prev) + " فایل بکاپ قبلی حذف شد.")
     if rep:
-        rep("بکاپ کامل شد و به تلگرام ارسال گردید (فقط آخرین بکاپ در چت باقی می‌ماند).")
+        rep("بکاپ کامل شد و به Google Drive آپلود گردید (فقط آخرین بکاپ در پوشه می‌ماند).")
     if vss:
         vss.delete()
     logger.close()
@@ -1235,40 +1345,38 @@ def run_restore(parts_dir=None, rep=None):
             rep(f"حالت محلی: بکاپ {run_id_} از {parts_dir} بازیابی می‌شود.")
     else:
         if rep:
-            rep("خواندن وضعیت آخرین بکاپ تلگرام...")
-        state = load_tg_state()
+            rep("خواندن وضعیت آخرین بکاپ Google Drive...")
+        state = load_gd_state()
         last_index = state.get("last_index") if isinstance(state, dict) else None
         if not last_index or not last_index.get("run_id"):
             if rep:
-                rep("هیچ بکاپی روی تلگرام ثبت نشده (شاخص یافت نشد).")
+                rep("هیچ بکاپی روی Drive ثبت نشده (شاخص یافت نشد).")
             logger.close()
             return 1
         run_id_ = last_index["run_id"]
         if rep:
             rep("جدیدترین بکاپ: " + run_id_)
 
-        ready, secrets = tg_credentials_ready()
+        ready, _secrets = gd_credentials_ready()
         if not ready:
             if rep:
-                rep("✗ اتصال تلگرام تنظیم نشده است؛ ابتدا توکن ربات و chat_id را وارد کن.")
+                rep("✗ اتصال Google Drive تنظیم نشده است؛ ابتدا از دکمه «اتصال گوگل درایو» حساب خودت را وصل کن.")
             logger.close()
             return 1
-        token = secrets["token"]
-        chat_id = load_settings().get("tg_chat_id")
 
         dl_dir = os.path.join(staging, "parts")
         os.makedirs(dl_dir, exist_ok=True)
 
-        # مانیفست: دانلود با file_id ثبت‌شده در شاخص
+        # مانیفست: دانلود با شناسه فایل ثبت‌شده در شاخص
         m_entry = (last_index.get("files") or {}).get(run_id_ + "_manifest.json")
         if not m_entry or not m_entry.get("file_id"):
             if rep:
-                rep("file_id مانیفست در شاخص یافت نشد؛ شاخص ناقص است.")
+                rep("شناسه فایل مانیفست در شاخص یافت نشد؛ شاخص ناقص است.")
             logger.close()
             return 1
         try:
             mpath = os.path.join(dl_dir, run_id_ + "_manifest.json")
-            tg_download_document(token, m_entry["file_id"], mpath)
+            gd_download_file(m_entry["file_id"], mpath)
             with open(mpath, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
         except Exception as ex:
@@ -1313,7 +1421,7 @@ def run_restore(parts_dir=None, rep=None):
             if rep:
                 rep("دانلود " + pk + "...")
             try:
-                tg_download_document(token, entry["file_id"], os.path.join(dl_dir, pk))
+                gd_download_file(entry["file_id"], os.path.join(dl_dir, pk))
                 if rep:
                     rep("  ✓ " + pk)
             except Exception as ex:
@@ -1823,12 +1931,12 @@ if _try_sys_imports():
             self.btn_auto.setObjectName("btnSecondary")
             self.btn_paths = QPushButton("مسیرهای سفارشی...")
             self.btn_paths.setObjectName("btnSecondary")
-            self.btn_tg = QPushButton("اتصال تلگرام...")
-            self.btn_tg.setObjectName("btnSecondary")
+            self.btn_gd = QPushButton("اتصال گوگل درایو...")
+            self.btn_gd.setObjectName("btnSecondary")
             self.btn_exit = QPushButton("خروج")
             self.btn_exit.setObjectName("btnExit")
 
-            hint = QLabel("بکاپ مستقیماً به چت تلگرامت ارسال می‌شود و فقط آخرین بکاپ در چت می‌ماند. پس از بازگردانی، نصب‌کننده Claude اجرا و npm جهانی بازنصب می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
+            hint = QLabel("بکاپ به Google Drive آپلود می‌شود و فقط آخرین بکاپ در پوشه می‌ماند. پس از بازگردانی، نصب‌کننده Claude اجرا و npm جهانی بازنصب می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
             hint.setObjectName("appSub")
             hint.setWordWrap(True)
 
@@ -1837,7 +1945,7 @@ if _try_sys_imports():
             row = QHBoxLayout()
             row.addWidget(self.btn_auto, 1)
             row.addWidget(self.btn_paths)
-            row.addWidget(self.btn_tg)
+            row.addWidget(self.btn_gd)
             cl.addLayout(row)
             cl.addWidget(hint)
 
@@ -1863,9 +1971,9 @@ if _try_sys_imports():
             self.btn_restore.clicked.connect(self.do_restore)
             self.btn_paths.clicked.connect(self.manage_paths)
             self.btn_auto.clicked.connect(self.toggle_auto)
-            self.btn_tg.clicked.connect(self.manage_telegram)
+            self.btn_gd.clicked.connect(self.manage_drive)
 
-            self._refresh_tg_button()
+            self._refresh_gd_button()
 
         def toggle_auto(self):
             if self.auto_timer is None:
@@ -1939,25 +2047,25 @@ if _try_sys_imports():
             sb = self.log.verticalScrollBar()
             sb.setValue(sb.maximum())
 
-        def _refresh_tg_button(self):
-            ready, _sec = tg_credentials_ready()
+        def _refresh_gd_button(self):
+            ready, _sec = gd_credentials_ready()
             if ready:
-                self.btn_tg.setText("اتصال تلگرام: ✓ فعال")
-            elif load_secrets().get("token") or load_settings().get("tg_chat_id"):
-                self.btn_tg.setText("اتصال تلگرام: ناقص!")
+                self.btn_gd.setText("گوگل درایو: ✓ فعال")
+            elif load_secrets().get("key_json") or load_settings().get("gd_folder_id"):
+                self.btn_gd.setText("گوگل درایو: ناقص!")
             else:
-                self.btn_tg.setText("اتصال تلگرام...")
+                self.btn_gd.setText("اتصال گوگل درایو...")
 
-        def manage_telegram(self):
-            dlg = TelegramDialog(self)
+        def manage_drive(self):
+            dlg = DriveDialog(self)
             dlg.exec()
-            self._refresh_tg_button()
+            self._refresh_gd_button()
 
         def _set_busy(self, busy, status=""):
             self.btn_backup.setEnabled(not busy)
             self.btn_restore.setEnabled(not busy)
             self.btn_paths.setEnabled(not busy)
-            self.btn_tg.setEnabled(not busy)
+            self.btn_gd.setEnabled(not busy)
             self.btn_exit.setEnabled(not busy)
             self.lbl_status.setText(status)
 
@@ -2022,80 +2130,126 @@ if _try_sys_imports():
             save_settings(s)
             super().accept()
 
-    class TelegramDialog(QDialog):
-        """تنظیم اتصال تلگرام: توکن ربات، تشخیص خودکار chat_id از آخرین پیام به ربات
-        یا ورود دستی آن؛ آزمایش اتصال با getMe/getChat."""
+    class DriveDialog(QDialog):
+        """اتصال Google Drive: انتخاب فایل OAuth Client JSON + مرورگر تأیید گوگل +
+        انتخاب پوشهٔ مقصد (نام یا شناسه). Refresh Token رمزنگاری‌شده ذخیره می‌شود."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("اتصال تلگرام")
-            self.setFixedSize(560, 320)
+            self.setWindowTitle("اتصال گوگل درایو")
+            self.setFixedSize(600, 380)
             v = QVBoxLayout(self)
-            v.addWidget(QLabel("۱) از @BotFather توکن ربات بگیر و اینجا وارد کن."))
-            v.addWidget(QLabel("۲) در تلگرام به ربات یک پیام بده (مثلاً /start) تا chat_id شناسایی شود."))
-            v.addWidget(QLabel("توکن ربات (با DPAPI ویندوز رمزنگاری و ذخیره می‌شود):"))
+            v.addWidget(QLabel("۱) فایل OAuth Client JSON (نوع Desktop app) را انتخاب کن — با DPAPI رمزنگاری می‌شود."))
+            h_key = QHBoxLayout()
             from PySide6.QtWidgets import QLineEdit
-            self.ed_token = QLineEdit()
-            self.ed_token.setEchoMode(QLineEdit.EchoMode.Password)
-            if load_secrets().get("token"):
-                self.ed_token.setPlaceholderText("توکن فعلی ذخیره شده — برای تغییر، جایگزینش کن")
-            v.addWidget(self.ed_token)
-            v.addWidget(QLabel("Chat ID (خالی بگذار تا از آخرین پیام به ربات شناسایی شود):"))
-            self.ed_chat = QLineEdit()
+            self.ed_key = QLineEdit()
+            self.ed_key.setEchoMode(QLineEdit.EchoMode.Password)
+            self.ed_key.setPlaceholderText("مسیر فایل JSON کلاینت OAuth")
+            if load_secrets().get("client_json"):
+                self.ed_key.setPlaceholderText("کلاینت فعلی ذخیره شده — برای تغییر، مسیر جدید بده")
+            self.b_browse = QPushButton("انتخاب...")
+            h_key.addWidget(self.ed_key, 1)
+            h_key.addWidget(self.b_browse)
+            v.addLayout(h_key)
+            self.b_auth = QPushButton("۲) ورود به گوگل و تأیید دسترسی")
+            v.addWidget(self.b_auth)
+            v.addWidget(QLabel("۳) پوشهٔ مقصد — نام یا شناسه پوشهٔ Drive خودت:"))
+            self.ed_folder = QLineEdit()
             s = load_settings()
-            if s.get("tg_chat_id"):
-                self.ed_chat.setText(str(s.get("tg_chat_id")))
-            v.addWidget(self.ed_chat)
+            if s.get("gd_folder_id"):
+                self.ed_folder.setText(str(s.get("gd_folder_id")))
+            v.addWidget(self.ed_folder)
             h = QHBoxLayout()
-            self.b_test = QPushButton("تست اتصال")
             self.b_save = QPushButton("ذخیره و فعال‌سازی")
             self.b_cancel = QPushButton("انصراف")
-            for b in (self.b_test, self.b_save, self.b_cancel):
-                h.addWidget(b)
+            h.addStretch(1)
+            h.addWidget(self.b_save)
+            h.addWidget(self.b_cancel)
             v.addLayout(h)
             self.lbl_result = QLabel("")
             self.lbl_result.setWordWrap(True)
             v.addWidget(self.lbl_result)
 
-            self.b_test.clicked.connect(self.do_test)
+            self.b_browse.clicked.connect(self.do_browse)
+            self.b_auth.clicked.connect(self.do_auth)
             self.b_save.clicked.connect(self.do_save)
             self.b_cancel.clicked.connect(self.reject)
+            self._client_json = ""
+            self._refresh_token = ""
 
-        def _token(self):
-            t = self.ed_token.text().strip()
-            if not t:
-                t = load_secrets().get("token", "")
-            return t
+        def do_browse(self):
+            path, _fl = QFileDialog.getOpenFileName(self, "انتخاب فایل کلاینت OAuth", "", "JSON (*.json)")
+            if path:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    inner = data.get("installed") if isinstance(data.get("installed"), dict) else data
+                    if inner.get("type") != "installed" or not inner.get("client_id"):
+                        self.lbl_result.setText("✗ این فایل کلاینت OAuth از نوع Desktop app نیست.")
+                        return
+                    self._client_json = json.dumps(data)
+                    self.ed_key.setText(path)
+                    self.lbl_result.setText("کلاینت خوانده شد؛ گام ۲ (ورود به گوگل) را بزن.")
+                except Exception as ex:
+                    self.lbl_result.setText("✗ خواندن کلاینت ناموفق: " + str(ex))
 
-        def do_test(self):
-            ok, msg = tg_test_connection(self._token(), self.ed_chat.text().strip() or None)
-            self.lbl_result.setText(msg)
+        def do_auth(self):
+            client = self._client_json or load_secrets().get("client_json", "")
+            if not client:
+                self.lbl_result.setText("✗ ابتدا فایل کلاینت OAuth را انتخاب کن.")
+                return
+            try:
+                self._refresh_token = gd_authorize_interactive(client, rep=self.lbl_result.setText)
+                self.lbl_result.setText("✓ تأیید شد؛ حالا گام ۳ (پوشهٔ مقصد) و «ذخیره» را انجام بده.")
+            except Exception as ex:
+                self.lbl_result.setText("✗ تأیید گوگل ناموفق: " + str(ex))
+
+        def _resolve_folder(self, value):
+            """ورودی می‌تواند شناسه پوشه یا نام پوشه باشد؛ شناسه واقعی برمی‌گرداند.
+            با scope محدود drive.file فقط فایل‌های ساختهٔ خود برنامه دیده می‌شوند —
+            اگر پوشهٔ هم‌نام پیدا نشد، خود برنامه آن را در Drive می‌سازد."""
+            if re.fullmatch(r"[A-Za-z0-9_-]{20,}", value):
+                try:
+                    fld = gd_request("GET", GD_DRIVE_API + "/files/" + urllib.parse.quote(value, safe=""),
+                                     params={"fields": "id,name"})
+                    return fld["id"], "پوشهٔ «" + fld.get("name", value) + "» تأیید شد"
+                except Exception:
+                    pass
+            params = {"q": "mimeType = 'application/vnd.google-apps.folder' and name = "
+                           "'" + value.replace("'", "\\'") + "' and trashed = false",
+                      "fields": "files(id,name)", "pageSize": "10"}
+            res = gd_request("GET", GD_DRIVE_API + "/files", params=params)
+            found = res.get("files", [])
+            if found:
+                return found[0]["id"], "پوشهٔ «" + found[0].get("name", value) + "» پیدا شد"
+            # پوشه را خود برنامه می‌سازد (فقط با drive.file این ممکن است)
+            created = gd_request("POST", GD_DRIVE_API + "/files",
+                                 params={"fields": "id,name"},
+                                 data=json.dumps({"name": value,
+                                                  "mimeType": "application/vnd.google-apps.folder"}).encode("utf-8"),
+                                 headers={"Content-Type": "application/json; charset=UTF-8"})
+            return created["id"], "پوشهٔ «" + created.get("name", value) + "» در Drive تو ساخته شد"
 
         def do_save(self):
-            token = self._token()
-            if not token:
-                self.lbl_result.setText("✗ توکن ربات را وارد کن.")
+            client = self._client_json or load_secrets().get("client_json", "")
+            refresh = self._refresh_token or load_secrets().get("refresh_token", "")
+            if not client or not refresh:
+                self.lbl_result.setText("✗ ابتدا ورود به گوگل (گام ۲) را کامل کن.")
                 return
-            chat = self.ed_chat.text().strip()
-            ok, msg = tg_test_connection(token, chat or None)
-            if not ok:
-                self.lbl_result.setText("✗ " + msg)
+            folder = self.ed_folder.text().strip()
+            if not folder:
+                self.lbl_result.setText("✗ نام یا شناسه پوشهٔ مقصد را وارد کن.")
                 return
-            if not chat:
-                try:
-                    chat, who = tg_detect_chat_id(token)
-                except Exception as ex:
-                    self.lbl_result.setText("✗ chat_id شناسایی نشد: " + str(ex))
-                    return
-                ok, msg = tg_test_connection(token, str(chat))
-                if not ok:
-                    self.lbl_result.setText("✗ " + msg)
-                    return
+            try:
+                fid, msg = self._resolve_folder(folder)
+            except Exception as ex:
+                self.lbl_result.setText("✗ " + str(ex))
+                return
             s = load_settings()
-            s["tg_chat_id"] = str(chat)
+            s["gd_folder_id"] = fid
             save_settings(s)
-            save_secrets(token)
-            self.lbl_result.setText("✓ اتصال ذخیره شد — از این پس بکاپ‌ها به تلگرامت ارسال می‌شود.")
+            save_secrets(client, refresh)
+            self.lbl_result.setText("✓ اتصال ذخیره شد (" + msg + ") — از این پس بکاپ‌ها به Google Drive آپلود می‌شود.")
             self.accept()
 
     def run_gui():
