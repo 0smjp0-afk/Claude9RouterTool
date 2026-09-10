@@ -40,7 +40,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.6.0"
+
+# ------------------------------------------------------------
+#  قفل رمز برنامه — فقط هش، هیچ‌گاه متن رمز ذخیره نمی‌شود
+#  PBKDF2-HMAC-SHA256 با salt رندم و ۲۰۰٬۰۰۰ دور؛ رمز خام در هیچ فایلی
+#  (سورس، EXE، ریپو) وجود ندارد و از هش قابل بازیابی نیست.
+# ------------------------------------------------------------
+AUTH_PBKDF2_ITERATIONS = 200_000
+AUTH_SALT_B64 = "rvqpWaMP9gSKhW/yOuk5YQ=="
+AUTH_HASH_B64 = "JaqO1BlAomOQ5La4JtQsBHliBezo3HTnZr3Z6lNYiN4="
+
+
+def auth_hash_password(password, salt_b64=AUTH_SALT_B64, iterations=AUTH_PBKDF2_ITERATIONS):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               base64.b64decode(salt_b64), iterations)
+
+
+def auth_verify_password(password):
+    """بررسی رمز با مقایسهٔ زمان‌ثابت (مقاوم به timing attack)."""
+    import hmac as _hmac
+    try:
+        expected = base64.b64decode(AUTH_HASH_B64)
+        return _hmac.compare_digest(auth_hash_password(password), expected)
+    except Exception:
+        return False
 
 USER_AGENT = APP_NAME + "/" + APP_VERSION
 
@@ -2076,6 +2100,9 @@ if _try_sys_imports():
             if self.worker is not None:
                 self._append("بکاپ خودکار این دوره رد شد (عملیات قبلی هنوز در حال اجراست).")
                 return
+            if not self._ensure_unlocked():
+                self._append("بکاپ خودکار این دوره رد شد (رمز تأیید نشد).")
+                return
             self._start(lambda rep: run_backup(upload=True, rep=rep), "بکاپ خودکار در حال اجرا...")
 
         def manage_paths(self):
@@ -2164,10 +2191,26 @@ if _try_sys_imports():
             if not ok:
                 self._append(msg)
 
+        def _ensure_unlocked(self):
+            """اولین عملیات حساس در هر اجرا، پنجرهٔ رمز را نشان می‌دهد."""
+            if getattr(self, "_unlocked", False):
+                return True
+            dlg = PasswordDialog(self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self._append("✗ ورود رمز انجام نشد؛ عملیات لغو شد.")
+                return False
+            self._unlocked = True
+            self._append("✓ رمز تأیید شد.")
+            return True
+
         def do_backup(self):
+            if not self._ensure_unlocked():
+                return
             self._start(lambda rep: run_backup(upload=True, rep=rep), "در حال بکاپ‌گیری...")
 
         def do_restore(self):
+            if not self._ensure_unlocked():
+                return
             self._start(lambda rep: run_restore(rep=rep), "در حال بازگردانی بکاپ...")
 
         def closeEvent(self, event):
@@ -2177,6 +2220,56 @@ if _try_sys_imports():
                 except Exception:
                     pass
             event.accept()
+
+    class PasswordDialog(QDialog):
+        """پنجرهٔ قفل رمز — ۵ تلاش با تاخیر تدریجی؛ رمز خام ذخیره نمی‌شود."""
+
+        MAX_TRIES = 5
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("قفل برنامه")
+            self.setFixedSize(420, 190)
+            self._tries = 0
+            v = QVBoxLayout(self)
+            v.addWidget(QLabel("برای ادامه، رمز برنامه را وارد کن:"))
+            from PySide6.QtWidgets import QLineEdit
+            self.ed_pw = QLineEdit()
+            self.ed_pw.setEchoMode(QLineEdit.EchoMode.Password)
+            self.ed_pw.setPlaceholderText("رمز")
+            v.addWidget(self.ed_pw)
+            self.lbl_result = QLabel("")
+            self.lbl_result.setObjectName("status")
+            self.lbl_result.setWordWrap(True)
+            v.addWidget(self.lbl_result)
+            h = QHBoxLayout()
+            h.addStretch(1)
+            self.b_ok = QPushButton("تأیید")
+            self.b_cancel = QPushButton("انصراف")
+            h.addWidget(self.b_ok)
+            h.addWidget(self.b_cancel)
+            v.addLayout(h)
+            self.b_ok.clicked.connect(self._check)
+            self.b_cancel.clicked.connect(self.reject)
+            self.ed_pw.returnPressed.connect(self._check)
+
+        def _check(self):
+            pw = self.ed_pw.text()
+            if auth_verify_password(pw):
+                self.accept()
+                return
+            self._tries += 1
+            left = self.MAX_TRIES - self._tries
+            if left <= 0:
+                self.lbl_result.setText("✗ تعداد تلاش‌ها تمام شد؛ پنجره بسته می‌شود.")
+                self.b_ok.setEnabled(False)
+                self.ed_pw.setEnabled(False)
+                QTimer.singleShot(1200, self.reject)
+                return
+            wait_s = min(2 * self._tries, 10)
+            self.b_ok.setEnabled(False)
+            self.lbl_result.setText("✗ رمز اشتباه است؛ " + str(left) + " تلاش باقی مانده — " + str(wait_s) + " ثانیه صبر کن...")
+            QTimer.singleShot(wait_s * 1000, lambda: self.b_ok.setEnabled(True))
 
     class IntervalDialog(QDialog):
         def __init__(self, parent=None):
