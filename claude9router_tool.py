@@ -5,11 +5,12 @@
 #  سرویس: Google Drive (حساب سرویس + پوشه اشتراکی در Drive کاربر)
 #    هر جزء بکاپ (زیپ/تکه/مانیفست/لاگ/شاخص) به‌صورت فایل در پوشه پشتیبان ذخیره می‌شود
 #    بازیابی با دانلود اجزای ثبت‌شده در شاخص انجام می‌شود
-#  بکاپ چهار مسیر پیش‌فرض:
+#  بکاپ پنج مسیر پیش‌فرض:
 #    AppData\Local\Claude-3p
 #    AppData\Roaming\9router
 #    %USERPROFILE%\.claude
 #    %USERPROFILE%\Downloads (کل پوشه دانلودها — در زیپ‌های مستقل ۹۸MB قابل‌بازکردن دستی)
+#    AppData\Local\Google\Chrome\User Data (پروفایل کامل کروم؛ فقط پوشه‌های کش کنار گذاشته می‌شوند)
 #  + مسیرهای سفارشی (پوشه/فایل) انتخابی کاربر: %LOCALAPPDATA%\Claude9RouterTool\custom_paths.json
 #  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۹۸MB شکسته می‌شود
 #  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← آپلود اجزای جدید به Drive ←
@@ -27,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -41,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.8.0"
 
 # ------------------------------------------------------------
 #  قفل رمز برنامه — فقط هش، هیچ‌گاه متن رمز ذخیره نمی‌شود
@@ -67,6 +69,68 @@ def auth_verify_password(password):
     except Exception:
         return False
 
+
+# ------------------------------------------------------------
+#  رمزنگاری اعتبارنامهٔ جاسازی‌شده (ChaCha20 + PBKDF2) — پایتون خالص
+#  چرا: فایل EXE روی ریپوی عمومی منتشر می‌شود. بدون این لایه، هر کسی می‌توانست
+#  توکن گوگل را از داخل باینری بیرون بکشد و به بکاپ‌ها (کوکی و رمزهای کروم)
+#  دسترسی پیدا کند. با رمزنگاری، EXE بدون رمز برنامه کاملاً بی‌استفاده است.
+#  نمک رمزنگاری همراه خود فایل جاسازی‌شده ذخیره می‌شود (نمک، راز نیست).
+# ------------------------------------------------------------
+
+def auth_derive_key(password, salt_b64, iterations=None):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               base64.b64decode(salt_b64),
+                               iterations or AUTH_PBKDF2_ITERATIONS, dklen=32)
+
+
+def _chacha20_block(key, counter, nonce):
+    """یک بلوک ۶۴ بایتی ChaCha20 (RFC 8439) با محاسبات صحیح ۳۲ بیتی."""
+    def rotl(v, c):
+        return ((v << c) | (v >> (32 - c))) & 0xFFFFFFFF
+
+    st = (list(struct.unpack("<4I", b"expand 32-byte k"))
+          + list(struct.unpack("<8I", key)) + [counter]
+          + list(struct.unpack("<3I", nonce)))
+    w = st[:]
+
+    def qr(a, b, c, d):
+        w[a] = (w[a] + w[b]) & 0xFFFFFFFF
+        w[d] = rotl(w[d] ^ w[a], 16)
+        w[c] = (w[c] + w[d]) & 0xFFFFFFFF
+        w[b] = rotl(w[b] ^ w[c], 12)
+        w[a] = (w[a] + w[b]) & 0xFFFFFFFF
+        w[d] = rotl(w[d] ^ w[a], 8)
+        w[c] = (w[c] + w[d]) & 0xFFFFFFFF
+        w[b] = rotl(w[b] ^ w[c], 7)
+
+    for _ in range(10):
+        qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
+    return struct.pack("<16I", *[(w[i] + st[i]) & 0xFFFFFFFF for i in range(16)])
+
+
+def _chacha20_xor(key, nonce, data):
+    out = bytearray()
+    for i in range(0, len(data), 64):
+        ks = _chacha20_block(key, i // 64, nonce)
+        out.extend(b ^ k for b, k in zip(data[i:i + 64], ks))
+    return bytes(out)
+
+
+def auth_encrypt(password, salt_b64, plaintext, iterations=None):
+    """base64(nonce(12) + ciphertext) برمی‌گرداند."""
+    key = auth_derive_key(password, salt_b64, iterations)
+    nonce = os.urandom(12)
+    return base64.b64encode(nonce + _chacha20_xor(key, nonce, plaintext.encode("utf-8"))).decode("ascii")
+
+
+def auth_decrypt(password, salt_b64, blob_b64, iterations=None):
+    key = auth_derive_key(password, salt_b64, iterations)
+    raw = base64.b64decode(blob_b64)
+    nonce, ct = raw[:12], raw[12:]
+    return _chacha20_xor(key, nonce, ct).decode("utf-8")
+
 USER_AGENT = APP_NAME + "/" + APP_VERSION
 
 # --- Google Drive ---
@@ -81,6 +145,17 @@ CHUNK_SIZE = 98 * 1024 * 1024           # حجم هر تکه برای فایل�
 
 SKIP_SUFFIXES = (".lock", ".tmp", ".part")
 SKIP_FILENAMES = {"SingletonCookie", "SingletonLock", "SingletonSocket"}
+
+# پروفایل کروم کامل بکاپ گرفته می‌شود (حساب‌ها، کوکی‌ها، بوکمارک‌ها، افزونه‌ها، تاریخچه).
+# فقط پوشه‌های کش/موقت کنار گذاشته می‌شوند؛ کروم خودش آن‌ها را از نو می‌سازد و
+# بکاپ‌شان فقط حجم را چند برابر می‌کند (حدود ۲۰۰ مگابایت در همین سیستم).
+CHROME_SKIP_DIRS = {
+    "Cache", "Code Cache", "GPUCache", "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache",
+    "GrShaderCache", "ShaderCache", "GraphiteDawnCache", "component_crx_cache",
+    "optimization_guide_model_store", "WasmTtsEngine", "Safe Browsing", "Crashpad",
+    "Sessions", "BrowserMetrics", "OriginTrials", "SwReporter",
+}
+CHROME_SKIP_SUFFIXES = (".pma", ".dmp")
 
 _PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
@@ -443,6 +518,7 @@ def build_backup_set(warnings, vss=None):
     nine = os.path.join(appdata(), "9router")
     dot_claude = os.path.join(userprofile(), ".claude")
     downloads = os.path.join(userprofile(), "Downloads")
+    chrome = os.path.join(localappdata(), "Google", "Chrome", "User Data")
 
     if os.path.isdir(claude):
         sources.append({"label": "Claude (Claude-3p)", "arcroot": "Claude-3p", "path": claude})
@@ -463,6 +539,17 @@ def build_backup_set(warnings, vss=None):
         sources.append({"label": "Downloads (کل پوشه دانلودها)", "arcroot": "Downloads", "path": downloads})
     else:
         warnings.append("پوشه Downloads (در پروفایل کاربر) پیدا نشد؛ این بخش در بکاپ ثبت نشد.")
+
+    if os.path.isdir(chrome):
+        sources.append({
+            "label": "Chrome (پروفایل کامل: حساب‌ها، کوکی‌ها، بوکمارک‌ها، افزونه‌ها)",
+            "arcroot": "Chrome", "path": chrome,
+            # لیست (نه set) تا در مانیفست JSON قابل ذخیره باشد
+            "exclude_dirs": sorted(CHROME_SKIP_DIRS),
+            "exclude_suffixes": list(CHROME_SKIP_SUFFIXES),
+        })
+    else:
+        warnings.append("پروفایل کروم پیدا نشد؛ بخش کروم در بکاپ ثبت نشد.")
 
     # مسیرهای سفارشی انتخابی کاربر (پوشه یا فایل) — هر منبع ریشه آرشیو یکتا می‌گیرد
     used_roots = {s["arcroot"] for s in sources}
@@ -514,9 +601,13 @@ def build_backup_set(warnings, vss=None):
                 "size": sz, "mtime": mt, "archive": None, "status": "pending",
             })
             continue
-        for root, _dirs, fnames in os.walk(
+        ex_dirs = set(src.get("exclude_dirs") or ())
+        ex_sufs = tuple(src.get("exclude_suffixes") or ())
+        for root, dirnames, fnames in os.walk(
             pth(src_path), onerror=lambda e: warnings.append("خطای خواندن پوشه: " + str(e))
         ):
+            if ex_dirs:
+                dirnames[:] = [d for d in dirnames if d not in ex_dirs]
             # root ممکن است داخل Snapshot باشد؛ مسیر منطقی واقعی را بساز:
             # مسیر اصلیِ منبع + بخش نسبیِ زیر درخت منبع
             tail = os.path.relpath(root, pth(src_path))
@@ -528,6 +619,8 @@ def build_backup_set(warnings, vss=None):
             for fname in sorted(fnames):
                 low = fname.lower()
                 if fname in SKIP_FILENAMES or low.endswith(SKIP_SUFFIXES):
+                    continue
+                if ex_sufs and low.endswith(ex_sufs):
                     continue
                 fpath = os.path.join(root, fname)
                 try:
@@ -709,6 +802,9 @@ _GD_OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file"
 _EMBEDDED_CLIENT_JSON = ""
 _EMBEDDED_REFRESH_TOKEN = ""
 _EMBEDDED_FOLDER_ID = ""
+_EMBEDDED_ENC = ""        # بلوب رمزنگاری‌شدهٔ اعتبارنامه (base64)
+_EMBEDDED_ENC_SALT = ""
+_EMBEDDED_ENC_ITER = None
 
 try:
     _emb_path = os.path.join(resource_dir(), "gd_embedded.json")
@@ -718,8 +814,29 @@ try:
         _EMBEDDED_CLIENT_JSON = _emb.get("client_json", "")
         _EMBEDDED_REFRESH_TOKEN = _emb.get("refresh_token", "")
         _EMBEDDED_FOLDER_ID = _emb.get("folder_id", "")
+        _EMBEDDED_ENC = _emb.get("enc", "")
+        _EMBEDDED_ENC_SALT = _emb.get("salt", "")
+        _EMBEDDED_ENC_ITER = _emb.get("iterations")
 except Exception:
     pass
+
+
+def gd_unlock_embedded(password):
+    """رمزگشایی اعتبارنامهٔ جاسازی‌شده با رمز برنامه.
+    اگر فایل جاسازی‌شده رمزنگاری نشده باشد یا قبلاً باز شده باشد، True برمی‌گرداند."""
+    global _EMBEDDED_CLIENT_JSON, _EMBEDDED_REFRESH_TOKEN, _EMBEDDED_FOLDER_ID
+    if not _EMBEDDED_ENC:
+        return True
+    if _EMBEDDED_CLIENT_JSON and _EMBEDDED_REFRESH_TOKEN:
+        return True
+    try:
+        data = json.loads(auth_decrypt(password, _EMBEDDED_ENC_SALT, _EMBEDDED_ENC, _EMBEDDED_ENC_ITER))
+    except Exception:
+        return False
+    _EMBEDDED_CLIENT_JSON = data.get("client_json", "")
+    _EMBEDDED_REFRESH_TOKEN = data.get("refresh_token", "")
+    _EMBEDDED_FOLDER_ID = data.get("folder_id", "")
+    return bool(_EMBEDDED_CLIENT_JSON and _EMBEDDED_REFRESH_TOKEN)
 
 
 def gd_get_folder_id():
@@ -1044,6 +1161,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
         os.path.join(appdata(), "9router"),
         os.path.join(userprofile(), ".claude"),
         os.path.join(userprofile(), "Downloads"),
+        os.path.join(localappdata(), "Google", "Chrome", "User Data"),
     ) + tuple(load_custom_paths()) if os.path.splitdrive(p)[0]})
     if not vss.start(drives):
         vss = None
@@ -1359,6 +1477,7 @@ def run_cmd_wait(cmdtext, rep=None, timeout=None):
     """دستور را در cmd اجرا و خروجی آن را خط‌به‌خط گزارش می‌کند؛ منتظر پایان می‌ماند."""
     proc = subprocess.Popen(
         ["cmd", "/c", cmdtext],
+        stdin=subprocess.DEVNULL,   # تا دستورهای تعاملی (pause / Read-Host) برنامه را قفل نکنند
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
         creationflags=CREATE_NO_WINDOW,
@@ -1414,8 +1533,40 @@ def run_installer(rep=None):
         return 1
 
 
+def kill_running_apps(image_names, rep=None):
+    """بستن برنامه‌هایی که فایل‌هایشان باید بازنویسی شود (مثل کرومِ در حال اجرا)."""
+    closed = []
+    for name in image_names:
+        try:
+            r = subprocess.run(["taskkill", "/IM", name, "/F"],
+                               capture_output=True, text=True,
+                               creationflags=CREATE_NO_WINDOW, timeout=60)
+            if r.returncode == 0:
+                closed.append(name)
+        except Exception:
+            pass
+    if closed and rep:
+        rep("  بسته شد تا فایل‌ها امن بازنویسی شوند: " + "، ".join(closed))
+    return closed
+
+
+def setup_scripts_dir():
+    """اسکریپت‌های راه‌اندازی جاسازی‌شده را در پوشهٔ محلی می‌ریزد و مسیر RUN-Setup.bat را برمی‌گرداند."""
+    base = os.path.join(localappdata(), APP_NAME, "setup")
+    try:
+        os.makedirs(base, exist_ok=True)
+        for n in ("RUN-Setup.bat", "Setup-FaKeyboard-Chrome-Dark.ps1", "Setup-FaKeyboard-DarkTheme.ps1"):
+            src = asset_path("setup/" + n)
+            if os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(base, n))
+    except Exception:
+        return None
+    target = os.path.join(base, "RUN-Setup.bat")
+    return target if os.path.isfile(target) else None
+
+
 def run_post_restore(rep=None):
-    """پس از بازگرداندن فایل‌ها: installer ← npm i -g npm ← npm i -g 9router."""
+    """پس از بازگرداندن فایل‌ها: installer ← npm i -g npm ← npm i -g 9router ← RUN-Setup.bat."""
     if os.environ.get("C9R_SELFTEST"):
         if rep:
             rep("(حالت خودآزمایی: گام‌های نصب اجرا نمی‌شوند)")
@@ -1431,7 +1582,28 @@ def run_post_restore(rep=None):
     rc3, _lines3 = run_cmd_wait("npm i -g 9router", rep=rep)
     if rc3 != 0 and rep:
         rep("  ⚠ 'npm i -g 9router' با کد " + str(rc3) + " پایان یافت.")
-    return 0 if (rc1 == 0 and rc2 == 0 and rc3 == 0) else 1
+    # گام پایانی: همان RUN-Setup.bat پوشهٔ Downloads (کیبورد فارسی، کروم پیش‌فرض، تم تاریک)
+    bat = setup_scripts_dir()
+    rc4 = 0
+    if bat:
+        if rep:
+            rep("اجرای RUN-Setup.bat (کیبورد فارسی، کروم پیش‌فرض، تم تاریک)...")
+        try:
+            rc4, _lines4 = run_cmd_wait('call "' + bat + '"', rep=rep, timeout=900)
+            if rc4 != 0 and rep:
+                rep("  ⚠ RUN-Setup.bat با کد " + str(rc4) + " پایان یافت.")
+        except subprocess.TimeoutExpired:
+            rc4 = 1
+            if rep:
+                rep("  ⚠ RUN-Setup.bat در زمان مقرر تمام نشد؛ بازیابی متوقف نشد.")
+        except Exception as ex:
+            rc4 = 1
+            if rep:
+                rep("  ⚠ اجرای RUN-Setup.bat ناموفق بود: " + str(ex))
+    else:
+        if rep:
+            rep("  ⚠ RUN-Setup.bat جاسازی‌شده پیدا نشد؛ این گام رد شد.")
+    return 0 if (rc1 == 0 and rc2 == 0 and rc3 == 0 and rc4 == 0) else 1
 
 
 # ------------------------------------------------------------
@@ -1595,6 +1767,14 @@ def run_restore(parts_dir=None, rep=None):
             logger.close()
             return 1
 
+    # کرومِ باز، فایل‌های پروفایلش را قفل می‌کند؛ برای بازنویسی امن بسته می‌شود
+    if not os.environ.get("C9R_SELFTEST") and any(
+            str(e.get("arcname", "")).startswith("Chrome/") for e in manifest["files"]):
+        if rep:
+            rep("بستن کروم (پروفایلش باید بازنویسی شود)...")
+        kill_running_apps(["chrome.exe"], rep=rep)
+        time.sleep(1.5)
+
     if rep:
         rep("بازگردانی فایل‌ها به مسیرهای اصلی...")
     results = {"files_ok": 0, "dirs_ok": 0, "failed": [], "skipped": []}
@@ -1723,6 +1903,13 @@ def selftest():
     note(U, "Downloads/setup.msi", b"M" * 4096)   # بکاپ کامل پوشه دانلودها
     note(U, "Downloads/docs/readme.txt", "downloads subfolder file\n")
     os.makedirs(os.path.join(U, "Downloads", "empty_sub"))  # پوشه خالی هم بازسازی شود
+    # پروفایل کروم: فایل‌های هویتی باید بکاپ شوند و کش‌ها نه
+    note(L, "Google/Chrome/User Data/Local State", '{"profile":{"info_cache":{}}}\n')
+    note(L, "Google/Chrome/User Data/Default/Bookmarks", '{"roots":{}}\n')
+    note(L, "Google/Chrome/User Data/Default/Cookies", b"SQLite format 3\x00" + b"C" * 2048)
+    note(L, "Google/Chrome/User Data/Default/Login Data", b"SQLite format 3\x00" + b"L" * 1024)
+    mk(L, "Google/Chrome/User Data/Default/Cache/data_0", b"CACHE" * 4096)   # باید نادیده گرفته شود
+    mk(L, "Google/Chrome/User Data/Safe Browsing/ChromeExtMalware.store", b"X" * 4096)
     # فایل بزرگ مصنوعی (تست شکستن به تکه) — ۷۰ مگابایت الگودار
     big_size = 70 * 1024 * 1024
     big_hash = None
@@ -1773,10 +1960,16 @@ def selftest():
         check("وجود مانیفست محلی", len(mpaths) == 1)
         manifest = json.load(open(mpaths[0], encoding="utf-8"))
         files = manifest["files"]
-        check("تعداد فایل‌های بکاپ = ۹", len(files) == 9)
+        check("تعداد فایل‌های بکاپ = ۱۳", len(files) == 13)
         check("فایل قفل (app.lock) نادیده گرفته شده", not any("app.lock" in f["arcname"] for f in files))
         check("فایل موقت (.tmp) نادیده گرفته شده", not any(".tmp" in f["arcname"] for f in files))
-        check("منابع پنج مسیر", {s["arcroot"] for s in manifest["sources"]} == {"Claude-3p", "9router", ".claude", "Downloads", "custom"})
+        check("منابع شش مسیر", {s["arcroot"] for s in manifest["sources"]} ==
+              {"Claude-3p", "9router", ".claude", "Downloads", "Chrome", "custom"})
+        chrome_names = {f["arcname"] for f in files if f["arcname"].startswith("Chrome/")}
+        check("پروفایل کروم بکاپ گرفته شده (Bookmarks/Cookies/Login Data/Local State)",
+              {"Chrome/Local State", "Chrome/Default/Bookmarks", "Chrome/Default/Cookies",
+               "Chrome/Default/Login Data"} <= chrome_names)
+        check("کش کروم در بکاپ نیست", not any("/Cache/" in n or "Safe Browsing" in n for n in chrome_names))
 
         big_e = [f for f in files if f["arcname"].endswith("big_file.bin")]
         check("فایل بزرگ تکه‌تکه شده", len(big_e) == 1 and big_e[0].get("chunked") is True)
@@ -1902,22 +2095,22 @@ if _try_sys_imports():
 
     QLabel#appTitle {
       color: #ffffff;
-      font-size: 26px;
+      font-size: 19px;
       font-weight: 600;
       letter-spacing: 0.5px;
     }
 
     QLabel#appSub {
       color: #a9c4e6;
-      font-size: 14px;
+      font-size: 11.5px;
     }
 
     QLabel#badge {
       background-color: qlineargradient(x1:0,y1:0,x2:1,y2:1,
                      stop:0 #4facfe, stop:1 #00f2fe);
       color: #06121f;
-      border-radius: 34px;
-      font-size: 22px;
+      border-radius: 25px;
+      font-size: 16px;
       font-weight: 700;
     }
 
@@ -1933,9 +2126,9 @@ if _try_sys_imports():
       color: #062838;
       border: 1px solid rgba(255,255,255,0.35);
       border-radius: 16px;
-      font-size: 18px;
+      font-size: 14px;
       font-weight: 600;
-      padding: 14px 18px;
+      padding: 9px 14px;
     }
     QPushButton#btnBackup:hover  { background-color: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #71c1ff, stop:1 #2ad4ff); }
     QPushButton#btnBackup:pressed{ padding-top: 16px; }
@@ -1946,9 +2139,9 @@ if _try_sys_imports():
       color: #062838;
       border: 1px solid rgba(255,255,255,0.35);
       border-radius: 16px;
-      font-size: 18px;
+      font-size: 14px;
       font-weight: 600;
-      padding: 14px 18px;
+      padding: 9px 14px;
     }
     QPushButton#btnRestore:hover  { background-color: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2ad4ff, stop:1 #b3ffbe); }
     QPushButton#btnRestore:pressed{ padding-top: 16px; }
@@ -1958,8 +2151,8 @@ if _try_sys_imports():
       color: #cfe0f5;
       border: 1px solid rgba(255,255,255,0.15);
       border-radius: 14px;
-      font-size: 15px;
-      padding: 10px 16px;
+      font-size: 13px;
+      padding: 7px 12px;
     }
     QPushButton#btnSecondary:hover { background-color: rgba(255,255,255,0.14); }
 
@@ -1968,8 +2161,8 @@ if _try_sys_imports():
       color: #cfe0f5;
       border: 1px solid rgba(255,255,255,0.15);
       border-radius: 14px;
-      font-size: 15px;
-      padding: 10px 16px;
+      font-size: 13px;
+      padding: 7px 12px;
     }
     QPushButton#btnExit:hover { background-color: rgba(255,255,255,0.14); }
 
@@ -1978,8 +2171,8 @@ if _try_sys_imports():
       border: 1px solid rgba(255,255,255,0.12);
       border-radius: 16px;
       color: #dcebff;
-      font-size: 13.5px;
-      padding: 12px;
+      font-size: 11.5px;
+      padding: 9px;
       selection-background-color: #4facfe;
     }
 
@@ -2050,7 +2243,8 @@ if _try_sys_imports():
         def __init__(self):
             super().__init__()
             self.setWindowTitle("بکاپ و بازگردانی کلود و 9router")
-            self.setFixedSize(780, 760)
+            # اندازه برای مانیتور ۱۳۶۶×۷۶۸ با نوار وظیفه تنظیم شده است
+            self.setFixedSize(700, 600)
             self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
             self.worker = None
             self.auto_timer = None
@@ -2058,19 +2252,19 @@ if _try_sys_imports():
 
         def _build_ui(self):
             root = QVBoxLayout(self)
-            root.setContentsMargins(26, 26, 26, 26)
-            root.setSpacing(16)
+            root.setContentsMargins(14, 12, 14, 12)
+            root.setSpacing(9)
 
             # هدر
             header = QFrame()
             header.setObjectName("cardHeader")
             hl = QHBoxLayout(header)
-            hl.setContentsMargins(20, 18, 20, 18)
-            hl.setSpacing(18)
+            hl.setContentsMargins(14, 12, 14, 12)
+            hl.setSpacing(12)
 
             badge = QLabel("C9R")
             badge.setObjectName("badge")
-            badge.setFixedSize(68, 68)
+            badge.setFixedSize(50, 50)
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hl.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -2078,7 +2272,7 @@ if _try_sys_imports():
             titles.setSpacing(2)
             title = QLabel("بکاپ و بازگردانی کلود و 9router")
             title.setObjectName("appTitle")
-            sub = QLabel("بکاپ چهار مسیر پیش‌فرض (شامل کل پوشه Downloads) + مسیرهای سفارشی؛ فایل بزرگ خودکار تکه‌تکه می‌شود")
+            sub = QLabel("بکاپ پنج مسیر پیش‌فرض (شامل کل Downloads و پروفایل کامل کروم) + مسیرهای سفارشی؛ فایل بزرگ خودکار تکه‌تکه می‌شود")
             sub.setObjectName("appSub")
             titles.addWidget(title)
             titles.addWidget(sub)
@@ -2089,8 +2283,8 @@ if _try_sys_imports():
             card = QFrame()
             card.setObjectName("cardGlass")
             cl = QVBoxLayout(card)
-            cl.setContentsMargins(22, 22, 22, 22)
-            cl.setSpacing(12)
+            cl.setContentsMargins(14, 12, 14, 12)
+            cl.setSpacing(9)
 
             self.btn_backup = QPushButton("بکاپ‌گیری (Backup)")
             self.btn_backup.setObjectName("btnBackup")
@@ -2105,7 +2299,7 @@ if _try_sys_imports():
             self.btn_exit = QPushButton("خروج")
             self.btn_exit.setObjectName("btnExit")
 
-            hint = QLabel("بکاپ به Google Drive آپلود می‌شود؛ ۲ نسخهٔ اخیر در پوشه می‌ماند و قدیمی‌ترها خودکار حذف می‌شوند. پس از بازگردانی، نصب‌کننده Claude اجرا و npm جهانی بازنصب می‌شود. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
+            hint = QLabel("بکاپ به Google Drive آپلود می‌شود؛ ۲ نسخهٔ اخیر در پوشه می‌ماند و قدیمی‌ترها خودکار حذف می‌شوند. پروفایل کامل کروم (حساب‌ها، کوکی‌ها، بوکمارک‌ها) هم بکاپ و بازگردانی می‌شود. پس از بازگردانی، نصب‌کننده Claude، npm و RUN-Setup.bat اجرا می‌شوند. فایل‌های باز با Snapshot (VSS) خوانده می‌شوند.")
             hint.setObjectName("appSub")
             hint.setWordWrap(True)
 
@@ -2174,7 +2368,7 @@ if _try_sys_imports():
         def manage_paths(self):
             dlg = QDialog(self)
             dlg.setWindowTitle("مسیرهای سفارشی بکاپ")
-            dlg.setFixedSize(560, 400)
+            dlg.setFixedSize(500, 340)
             v = QVBoxLayout(dlg)
             v.addWidget(QLabel("پوشه یا فایل دلخواه اضافه کنید (فایل بزرگ‌تر از ۱۰۰MB به تکه‌های ۹۸MB شکسته می‌شود):"))
             lst = QListWidget()
@@ -2266,7 +2460,14 @@ if _try_sys_imports():
                 self._append("✗ ورود رمز انجام نشد؛ عملیات لغو شد.")
                 return False
             self._unlocked = True
-            self._append("✓ رمز تأیید شد.")
+            if gd_unlock_embedded(getattr(dlg, "verified_password", "")):
+                self._append("✓ رمز تأیید شد.")
+            else:
+                self._append("⚠ اعتبارنامهٔ رمزنگاری‌شدهٔ داخل برنامه باز نشد؛ اگر بکاپ ابری لازم است دوباره وصل کن.")
+            try:
+                self._refresh_gd_button()
+            except Exception:
+                pass
             return True
 
         def do_backup(self):
@@ -2295,8 +2496,9 @@ if _try_sys_imports():
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setWindowTitle("قفل برنامه")
-            self.setFixedSize(420, 190)
+            self.setFixedSize(400, 175)
             self._tries = 0
+            self.verified_password = ""
             v = QVBoxLayout(self)
             v.addWidget(QLabel("برای ادامه، رمز برنامه را وارد کن:"))
             from PySide6.QtWidgets import QLineEdit
@@ -2322,6 +2524,7 @@ if _try_sys_imports():
         def _check(self):
             pw = self.ed_pw.text()
             if auth_verify_password(pw):
+                self.verified_password = pw
                 self.accept()
                 return
             self._tries += 1
@@ -2341,7 +2544,7 @@ if _try_sys_imports():
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setWindowTitle("فاصله بکاپ خودکار")
-            self.setFixedSize(360, 150)
+            self.setFixedSize(330, 145)
             self.minutes = 60
             v = QVBoxLayout(self)
             v.addWidget(QLabel("بکاپ خودکار هر چند دقیقه یکبار اجرا شود؟"))
@@ -2375,7 +2578,7 @@ if _try_sys_imports():
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setWindowTitle("اتصال گوگل درایو")
-            self.setFixedSize(600, 380)
+            self.setFixedSize(540, 350)
             v = QVBoxLayout(self)
             v.addWidget(QLabel("۱) فایل OAuth Client JSON (نوع Desktop app) را انتخاب کن — با DPAPI رمزنگاری می‌شود."))
             h_key = QHBoxLayout()
@@ -2504,7 +2707,7 @@ if _try_sys_imports():
         app.setApplicationName(APP_NAME)
         app.setApplicationVersion(APP_VERSION)
         load_fonts()
-        app.setFont(app_font(15))
+        app.setFont(app_font(13))
         w = MainWindow()
         w.setStyleSheet(GLASS_QSS)
         w.show()
@@ -2553,12 +2756,21 @@ def main():
         print("PySide6 نصب نیست؛ نمی‌توان GUI را اجرا کرد.", file=sys.stderr)
         return 1
 
-    if not (os.environ.get("C9R_SELFTEST") or is_admin()):
-        # ارتقا به ادمین و خروج (GUI بالا با سطح ادمین باز می‌شود)
+    if not (os.environ.get("C9R_SELFTEST") or os.environ.get("C9R_NO_ELEVATE") or is_admin()):
+        # همیشه با دسترسی Administrator اجرا می‌شود: Snapshot ویندوز (VSS)، خواندن پروفایل
+        # قفل‌شدهٔ کروم، npm جهانی و RUN-Setup.bat همه به این سطح دسترسی نیاز دارند.
         print("ارتقا به سطح Administrator...")
         if elevate():
             return 0
         print("اجرای سطح Administrator رد شد.", file=sys.stderr)
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "این برنامه برای بکاپ گرفتن (Snapshot ویندوز، پروفایل کروم و npm) به دسترسی "
+                "Administrator نیاز دارد.\nپنجرهٔ UAC را تأیید کن و برنامه را دوباره اجرا کن.",
+                APP_NAME, 0x10)
+        except Exception:
+            pass
         return 1
 
     return run_gui()
