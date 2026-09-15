@@ -9,7 +9,7 @@
 #    AppData\Local\Claude-3p
 #    AppData\Roaming\9router
 #    %USERPROFILE%\.claude
-#    %USERPROFILE%\Downloads (کل پوشه دانلودها)
+#    %USERPROFILE%\Downloads (کل پوشه دانلودها — در زیپ‌های مستقل ۹۸MB قابل‌بازکردن دستی)
 #  + مسیرهای سفارشی (پوشه/فایل) انتخابی کاربر: %LOCALAPPDATA%\Claude9RouterTool\custom_paths.json
 #  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۹۸MB شکسته می‌شود
 #  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← آپلود اجزای جدید به Drive ←
@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 
 # ------------------------------------------------------------
 #  قفل رمز برنامه — فقط هش، هیچ‌گاه متن رمز ذخیره نمی‌شود
@@ -601,16 +601,18 @@ def assign_parts(entries_files, target):
     return parts
 
 
-def write_archives(run_id_, parts, dir_entries, out_dir, warnings, logger, rep=None, vss=None):
+def write_archives(run_id_, parts, dir_entries, out_dir, warnings, logger, rep=None, vss=None, kind="part", extra_text=None):
     created = []
     for i, part in enumerate(parts, 1):
-        name = f"{run_id_}_part{i}.zip"
+        name = f"{run_id_}_{kind}{i}.zip"
         path = os.path.join(out_dir, name)
         zipped, size = 0, 0
         with zipfile.ZipFile(longpath(path), "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
             if i == 1:
                 for d in dir_entries:
                     z.writestr(d["arcname"] + "/", "")
+                if extra_text:
+                    z.writestr("READ_ME_Downloads_Backup.txt", extra_text.encode("utf-8"))
             for e in part:
                 e["archive"] = name
                 try:
@@ -1075,13 +1077,50 @@ def run_backup(upload=True, out_dir=None, rep=None):
         for cp, _st, ln in chunks:
             chunk_artifacts.append((os.path.basename(cp), cp, ln))
 
-    parts = assign_parts(small_entries, PART_TARGET)
-    if rep:
-        rep(f"فشرده‌سازی {len(files)} فایل در {len(parts)} بخش...")
-    archives = write_archives(run_id_, parts, dirs, out_dir, warnings, logger, rep=rep, vss=vss)
+    # --- تفکیک: فایل‌های دانلودها به زیپ‌های مستقل (قابل بازکردن دستی) ---
+    # هر زیپ یک بخش مستقل ≤۹۸MB است و فایل‌ها بین زیپ‌ها تکه‌تکه نمی‌شوند؛
+    # فقط فایل تکی بزرگ‌تر از ۱۰۰MB مثل قبل به .c9chunk تبدیل می‌شود
+    # (در زیپ ≤۹۸MB نمی‌گنجد) — آن‌ها فقط با خودِ برنامه بازیابی می‌شوند.
+    downloads_active = any(s["arcroot"] == "Downloads" for s in sources)
 
-    log_text = build_log_text(run_id_, sources, files, dirs, warnings, parts, chunk_artifacts=chunk_artifacts)
-    manifest = build_manifest(run_id_, sources, files, dirs, warnings, parts)
+    def _is_dl(arcname):
+        return downloads_active and arcname.startswith("Downloads/")
+
+    dl_entries = [e for e in small_entries if _is_dl(e["arcname"])]
+    other_entries = [e for e in small_entries if not _is_dl(e["arcname"])]
+    dirs_dl = [d for d in dirs if _is_dl(d["arcname"])]
+    dirs_main = [d for d in dirs if not _is_dl(d["arcname"])]
+
+    read_me_dl = (
+        "\r\n".join([
+            "بکاپ پوشه دانلودها — Claude9RouterTool v" + APP_VERSION,
+            "=" * 60,
+            "این زیپ‌ها نسخه کامل پوشه Downloads در تاریخ بکاپ هستند.",
+            "هر فایل dlpart چند نقطه‌ای یک زیپ مستقل و کامل است (≤۹۸ مگابایت):",
+            "با دابل‌کلیک روی هرکدام در ویندوز اکسپلورر مستقیم باز می‌شود.",
+            "فایل‌ها بین بخش‌ها تقسیم نشده‌اند — هر فایل کامل داخل یکی از بخش‌ها است.",
+            "فایل‌های تکی بزرگ‌تر از ۱۰۰ مگابایت به‌صورت *.c9chunk کنار این زیپ‌ها",
+            "ذخیره شده‌اند و فقط با خودِ برنامه (دکمه بازگردانی) بازیابی می‌شوند.",
+            "برای بازگردانی دقیق سرِ مسیرها، دکمه «بازگردانی بکاپ» را در برنامه بزن.",
+        ]) + "\r\n"
+    )
+
+    parts = assign_parts(other_entries, PART_TARGET)
+    if rep:
+        rep(f"فشرده‌سازی {len(other_entries)} فایل معمولی + {len(big_entries)} فایل بزرگ در {len(parts)} بخش...")
+    archives = write_archives(run_id_, parts, dirs_main, out_dir, warnings, logger, rep=rep, vss=vss)
+
+    dlarchives = []
+    dl_parts = []
+    if downloads_active:
+        dl_parts = assign_parts(dl_entries, PART_TARGET)
+        if rep:
+            rep("ساخت زیپ‌های مستقلِ پوشه Downloads (" + str(len(dl_parts)) + " بخش ≤۹۸MB، آماده بازکردن دستی)...")
+        dlarchives = write_archives(run_id_, dl_parts, dirs_dl, out_dir, warnings, logger,
+                                    rep=rep, vss=vss, kind="dlpart", extra_text=read_me_dl)
+
+    log_text = build_log_text(run_id_, sources, files, dirs, warnings, parts + dl_parts, chunk_artifacts=chunk_artifacts)
+    manifest = build_manifest(run_id_, sources, files, dirs, warnings, parts + dl_parts)
 
     manifest_path = os.path.join(out_dir, run_id_ + "_manifest.json")
     log_path = os.path.join(out_dir, run_id_ + "_log.txt")
@@ -1105,8 +1144,8 @@ def run_backup(upload=True, out_dir=None, rep=None):
     total = sum(e["size"] for e in files)
     if rep:
         rep(f"بکاپ محلی: {len(files)} فایل، {format_bytes(total)}")
-        for name, path, cnt, sz in archives:
-            rep(f"  آرشیو {name}: {cnt} فایل، {format_bytes(sz)}")
+        for name, path, cnt, sz in archives + dlarchives:
+            rep(f"  آرشیو {name}: {cnt} فایل، {format_bytes(os.path.getsize(longpath(path)))}")
         rep(f"مسیر: {out_dir}")
         for w in warnings:
             rep("هشدار: " + w)
@@ -1120,7 +1159,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
         return 0
 
     # --- اعتبارسنجی بکاپ محلی (پیش از هر تماس با Drive) ---
-    uploads = [(name, path, sz) for (name, path, _cnt, sz) in archives] + list(chunk_artifacts)
+    uploads = [(name, path, sz) for (name, path, _cnt, sz) in archives + dlarchives] + list(chunk_artifacts)
     verify = list(uploads) + [
         (run_id_ + "_manifest.json", manifest_path, 0),
         (run_id_ + "_log.txt", log_path, 0),
@@ -1748,10 +1787,26 @@ def selftest():
         archives = sorted({f["archive"] for f in files if f.get("archive")})
         check("همه فایل‌های معمولی به آرشیو اختصاص یافته‌اند", all(a for a in archives) and all(
             os.path.isfile(os.path.join(out, a)) for a in archives))
+        # --- زیپ‌های مستقل Downloads ---
+        dl_arch = sorted({f["archive"] for f in files
+                          if f.get("archive") and "_dlpart" in f["archive"]})
+        check("فایل‌های Downloads در زیپ‌های مستقل dlpart هستند", bool(dl_arch) and all(
+            a.endswith(".zip") and os.path.isfile(os.path.join(out, a)) for a in dl_arch))
+        dl_files = [f for f in files if f["arcname"].startswith("Downloads/") and f.get("archive")]
+        check("هیچ فایل معمولی Downloads در زیپ اصلی نیست",
+              all("_dlpart" in f["archive"] for f in dl_files))
+        check("هر زیپ dlpart فقط شامل Downloads است", all(
+            all(n.startswith("Downloads/") or n == "READ_ME_Downloads_Backup.txt" or n.endswith("/") or
+                n in ("backup_manifest_summary.json", "backup.log")
+                for n in zipfile.ZipFile(longpath(os.path.join(out, a))).namelist())
+            for a in dl_arch))
+        check("بخش اول dlpart راهنمای فارسی دارد",
+              "READ_ME_Downloads_Backup.txt" in zipfile.ZipFile(longpath(os.path.join(out, dl_arch[0]))).namelist())
+        main_part1 = manifest["run_id"] + "_part1.zip"
         chunk_keys = [c["key"] for f in files if f.get("chunked") for c in f.get("chunks", [])]
         check("تکه‌های فایل بزرگ روی دیسک موجودند", all(
             os.path.isfile(os.path.join(out, k)) for k in chunk_keys))
-        with zipfile.ZipFile(longpath(os.path.join(out, archives[0]))) as z:
+        with zipfile.ZipFile(longpath(os.path.join(out, main_part1))) as z:
             names = z.namelist()
         check("بخش اول شامل خلاصهٔ مانیفست و لاگ است",
               "backup_manifest_summary.json" in names and "backup.log" in names)
