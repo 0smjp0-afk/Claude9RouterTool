@@ -5,10 +5,11 @@
 #  سرویس: Google Drive (حساب سرویس + پوشه اشتراکی در Drive کاربر)
 #    هر جزء بکاپ (زیپ/تکه/مانیفست/لاگ/شاخص) به‌صورت فایل در پوشه پشتیبان ذخیره می‌شود
 #    بازیابی با دانلود اجزای ثبت‌شده در شاخص انجام می‌شود
-#  بکاپ سه مسیر پیش‌فرض:
+#  بکاپ چهار مسیر پیش‌فرض:
 #    AppData\Local\Claude-3p
 #    AppData\Roaming\9router
 #    %USERPROFILE%\.claude
+#    %USERPROFILE%\Downloads (کل پوشه دانلودها)
 #  + مسیرهای سفارشی (پوشه/فایل) انتخابی کاربر: %LOCALAPPDATA%\Claude9RouterTool\custom_paths.json
 #  فایل تکی بزرگ‌تر از ۱۰۰MB به تکه‌های ۹۸MB شکسته می‌شود
 #  هر بکاپ: ابتدا بکاپ محلی کامل و کنترل ← آپلود اجزای جدید به Drive ←
@@ -40,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 
 # ------------------------------------------------------------
 #  قفل رمز برنامه — فقط هش، هیچ‌گاه متن رمز ذخیره نمی‌شود
@@ -429,11 +430,11 @@ def gd_credentials_ready():
 
 
 # ------------------------------------------------------------
-#  ساخت مجموعه بکاپ (سه مسیر پیش‌فرض + مسیرهای سفارشی)
+#  ساخت مجموعه بکاپ (چهار مسیر پیش‌فرض + مسیرهای سفارشی)
 # ------------------------------------------------------------
 
 def build_backup_set(warnings, vss=None):
-    """برمی‌گرداند: (sources, files, dirs). مسیرها: Claude-3p، 9router، ‎.claude و سفارشی‌ها."""
+    """برمی‌گرداند: (sources, files, dirs). مسیرها: Claude-3p، 9router، ‎.claude، Downloads و سفارشی‌ها."""
     sources = []
     files = []
     dirs = []
@@ -441,6 +442,7 @@ def build_backup_set(warnings, vss=None):
     claude = os.path.join(localappdata(), "Claude-3p")
     nine = os.path.join(appdata(), "9router")
     dot_claude = os.path.join(userprofile(), ".claude")
+    downloads = os.path.join(userprofile(), "Downloads")
 
     if os.path.isdir(claude):
         sources.append({"label": "Claude (Claude-3p)", "arcroot": "Claude-3p", "path": claude})
@@ -456,6 +458,11 @@ def build_backup_set(warnings, vss=None):
         sources.append({"label": "Claude (.claude)", "arcroot": ".claude", "path": dot_claude})
     else:
         warnings.append("پوشه .claude (در پروفایل کاربر) پیدا نشد؛ این بخش در بکاپ ثبت نشد.")
+
+    if os.path.isdir(downloads):
+        sources.append({"label": "Downloads (کل پوشه دانلودها)", "arcroot": "Downloads", "path": downloads})
+    else:
+        warnings.append("پوشه Downloads (در پروفایل کاربر) پیدا نشد؛ این بخش در بکاپ ثبت نشد.")
 
     # مسیرهای سفارشی انتخابی کاربر (پوشه یا فایل) — هر منبع ریشه آرشیو یکتا می‌گیرد
     used_roots = {s["arcroot"] for s in sources}
@@ -1034,6 +1041,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
         os.path.join(localappdata(), "Claude-3p"),
         os.path.join(appdata(), "9router"),
         os.path.join(userprofile(), ".claude"),
+        os.path.join(userprofile(), "Downloads"),
     ) + tuple(load_custom_paths()) if os.path.splitdrive(p)[0]})
     if not vss.start(drives):
         vss = None
@@ -1673,6 +1681,9 @@ def selftest():
     note(U, ".claude/settings.json", '{"model":"claude-fable-5"}\n')
     note(U, ".claude/projects/demo/history.jsonl", '{"role":"user"}\n')
     mk(U, ".claude/some.tmp", b"TMP")             # باید نادیده گرفته شود
+    note(U, "Downloads/setup.msi", b"M" * 4096)   # بکاپ کامل پوشه دانلودها
+    note(U, "Downloads/docs/readme.txt", "downloads subfolder file\n")
+    os.makedirs(os.path.join(U, "Downloads", "empty_sub"))  # پوشه خالی هم بازسازی شود
     # فایل بزرگ مصنوعی (تست شکستن به تکه) — ۷۰ مگابایت الگودار
     big_size = 70 * 1024 * 1024
     big_hash = None
@@ -1723,10 +1734,10 @@ def selftest():
         check("وجود مانیفست محلی", len(mpaths) == 1)
         manifest = json.load(open(mpaths[0], encoding="utf-8"))
         files = manifest["files"]
-        check("تعداد فایل‌های بکاپ = ۷", len(files) == 7)
+        check("تعداد فایل‌های بکاپ = ۹", len(files) == 9)
         check("فایل قفل (app.lock) نادیده گرفته شده", not any("app.lock" in f["arcname"] for f in files))
         check("فایل موقت (.tmp) نادیده گرفته شده", not any(".tmp" in f["arcname"] for f in files))
-        check("منابع چهار مسیر", {s["arcroot"] for s in manifest["sources"]} == {"Claude-3p", "9router", ".claude", "custom"})
+        check("منابع پنج مسیر", {s["arcroot"] for s in manifest["sources"]} == {"Claude-3p", "9router", ".claude", "Downloads", "custom"})
 
         big_e = [f for f in files if f["arcname"].endswith("big_file.bin")]
         check("فایل بزرگ تکه‌تکه شده", len(big_e) == 1 and big_e[0].get("chunked") is True)
@@ -2012,7 +2023,7 @@ if _try_sys_imports():
             titles.setSpacing(2)
             title = QLabel("بکاپ و بازگردانی کلود و 9router")
             title.setObjectName("appTitle")
-            sub = QLabel("بکاپ سه مسیر پیش‌فرض + مسیرهای سفارشی؛ فایل بزرگ خودکار تکه‌تکه می‌شود")
+            sub = QLabel("بکاپ چهار مسیر پیش‌فرض (شامل کل پوشه Downloads) + مسیرهای سفارشی؛ فایل بزرگ خودکار تکه‌تکه می‌شود")
             sub.setObjectName("appSub")
             titles.addWidget(title)
             titles.addWidget(sub)
