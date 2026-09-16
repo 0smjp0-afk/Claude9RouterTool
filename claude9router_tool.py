@@ -887,8 +887,21 @@ def gd_get_access_token():
             "grant_type": "refresh_token",
         }).encode("utf-8")
         req = urllib.request.Request(GD_TOKEN_URL, data=data, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            res = json.loads(r.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                res = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as ex:
+            # 400 invalid_grant یعنی Refresh Token باطل یا منقضی شده — خطای موقت نیست،
+            # پس تلاش مجدد بی‌فایده است و کاربر باید از نو وصل کند.
+            try:
+                detail = json.loads(ex.read().decode("utf-8"))
+            except Exception:
+                detail = {}
+            if detail.get("error") == "invalid_grant":
+                raise RuntimeError(
+                    "اتصال گوگل درایو دیگر معتبر نیست (Refresh Token باطل یا منقضی شده است). "
+                    "از دکمهٔ «اتصال گوگل درایو...» دوباره وارد شو تا اعتبار تازه ساخته شود.") from None
+            raise
         if "access_token" not in res:
             raise RuntimeError("دریافت توکن گوگل ناموفق: " + str(res)[:200])
         _GD_AUTH["token"] = res["access_token"]

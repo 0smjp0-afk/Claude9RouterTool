@@ -19,3 +19,5 @@ desktop.ini
 *.local
 .env
 gd_embedded.json
+gd_embedded.json.*
+*.bak-*
