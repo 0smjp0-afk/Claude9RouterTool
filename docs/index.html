@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude9RouterTool — بکاپ و بازیابی ویندوز</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#5a5a5a; --accent:#2b6cb0; --line:#e2e2e2; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:48px 20px; font-family:-apple-system,"Segoe UI",Tahoma,sans-serif;
+         line-height:1.85; color:var(--fg); background:#fff; }
+  main { max-width:720px; margin:0 auto; }
+  h1 { font-size:1.9rem; margin:0 0 6px; }
+  .sub { color:var(--muted); margin:0 0 32px; }
+  h2 { font-size:1.15rem; margin:34px 0 10px; padding-top:22px; border-top:1px solid var(--line); }
+  ul { padding-right:20px; margin:10px 0; }
+  li { margin:6px 0; }
+  code { background:#f4f4f4; padding:2px 6px; border-radius:4px; font-size:.9em;
+         font-family:Consolas,Monaco,monospace; direction:ltr; display:inline-block; }
+  a { color:var(--accent); }
+  footer { margin-top:44px; padding-top:20px; border-top:1px solid var(--line);
+           color:var(--muted); font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Claude9RouterTool</h1>
+<p class="sub">ابزار بکاپ و بازیابی ویندوز — نسخه ۲.۹.۰</p>
+
+<p>
+  ابزار شخصی برای بکاپ‌گیری و بازگردانی تنظیمات Claude Code، 9Router، پوشهٔ Downloads و
+  پروفایل کامل مرورگر Google Chrome. بکاپ‌ها مستقیماً به حساب Google Drive خودِ کاربر
+  آپلود می‌شوند و هیچ سرور واسطی در میان نیست.
+</p>
+
+<h2>ویژگی‌ها</h2>
+<ul>
+  <li>آپلود و دانلود موازی (چهار فایل هم‌زمان) و آپلود resumable برای فایل‌های بزرگ</li>
+  <li>پشتیبان‌گیری از فایل‌های در حال استفاده با Snapshot ویندوز (VSS)</li>
+  <li>پروفایل کامل کروم: حساب‌ها، کوکی‌ها، بوکمارک‌ها، افزونه‌ها و رمزهای ذخیره‌شده</li>
+  <li>نگهداری دو نسخهٔ اخیر بکاپ روی Drive</li>
+  <li>رابط کاربری فارسی با فونت وزیرمتن</li>
+</ul>
+
+<h2>دسترسی و امنیت</h2>
+<ul>
+  <li>دسترسی برنامه به Google Drive با محدودهٔ <code>drive.file</code> انجام می‌شود؛ یعنی فقط فایل‌هایی که خودِ برنامه ساخته، و نه بقیهٔ Drive کاربر.</li>
+  <li>توکن دسترسی با ChaCha20 و کلید مشتق‌شده از PBKDF2 (۲۰۰٬۰۰۰ دور) رمزنگاری می‌شود.</li>
+  <li>روی هر رایانه، اعتبارنامهٔ محلی با DPAPI ویندوز محافظت می‌شود.</li>
+  <li>هیچ تحلیل‌گر، تلمتری یا ردیابی در برنامه وجود ندارد.</li>
+</ul>
+
+<h2>پیوندها</h2>
+<ul>
+  <li><a href="privacy.html">سیاست حریم خصوصی</a></li>
+  <li><a href="https://github.com/0smjp0-afk/Claude9RouterTool">مخزن پروژه در GitHub</a></li>
+  <li><a href="https://github.com/0smjp0-afk/Claude9RouterTool/releases">دریافت آخرین نسخه</a></li>
+  <li><a href="https://github.com/0smjp0-afk/Claude9RouterTool/issues">گزارش مشکل</a></li>
+</ul>
+
+<footer>
+  ساخته‌شده برای نگه‌داشتن تنظیمات Claude و 9Router در امان.
+</footer>
+
+</main>
+</body>
+</html>

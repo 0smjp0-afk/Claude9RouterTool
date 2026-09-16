@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>سیاست حریم خصوصی — Claude9RouterTool</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#5a5a5a; --accent:#2b6cb0; --line:#e2e2e2; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:48px 20px; font-family:-apple-system,"Segoe UI",Tahoma,sans-serif;
+         line-height:1.85; color:var(--fg); background:#fff; }
+  main { max-width:720px; margin:0 auto; }
+  h1 { font-size:1.8rem; margin:0 0 6px; }
+  .sub { color:var(--muted); margin:0 0 32px; }
+  h2 { font-size:1.15rem; margin:34px 0 10px; padding-top:22px; border-top:1px solid var(--line); }
+  ul { padding-right:20px; margin:10px 0; }
+  li { margin:6px 0; }
+  code { background:#f4f4f4; padding:2px 6px; border-radius:4px; font-size:.9em;
+         font-family:Consolas,Monaco,monospace; direction:ltr; display:inline-block; }
+  a { color:var(--accent); }
+  .en { direction:ltr; text-align:left; }
+  .en ul { padding-left:20px; padding-right:0; }
+  footer { margin-top:44px; padding-top:20px; border-top:1px solid var(--line);
+           color:var(--muted); font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>سیاست حریم خصوصی</h1>
+<p class="sub">آخرین به‌روزرسانی: ۱۶ سپتامبر ۲۰۲۶</p>
+
+<h2>خلاصه</h2>
+<p>
+  Claude9RouterTool یک ابزار شخصی برای بکاپ‌گیری و بازیابی تنظیمات روی ویندوز است.
+  این برنامه <strong>هیچ داده‌ای را به هیچ سروری جز حساب Google Drive خودِ کاربر ارسال نمی‌کند</strong>.
+  هیچ سرور واسط، تحلیل‌گر، تلمتری یا ردیاب در آن وجود ندارد.
+</p>
+
+<h2>چه داده‌ای خوانده می‌شود</h2>
+<p>برنامه فقط زمانی اجرا می‌شود که کاربر خودش دکمهٔ بکاپ‌گیری یا بازگردانی را بزند. در آن صورت، این مسیرهای روی همان رایانه خوانده می‌شوند:</p>
+<ul>
+  <li>پوشهٔ تنظیمات و تاریخچهٔ Claude Code</li>
+  <li>پوشهٔ تنظیمات 9Router</li>
+  <li>پوشهٔ Downloads کاربر</li>
+  <li>پروفایل مرورگر Google Chrome</li>
+  <li>هر مسیر سفارشی که کاربر خودش اضافه کرده باشد</li>
+</ul>
+
+<h2>داده‌ها کجا می‌روند</h2>
+<ul>
+  <li><strong>هیچ‌کجا جز حساب Google Drive خودِ کاربر.</strong> دسترسی برنامه با محدودهٔ <code>drive.file</code> انجام می‌شود؛ یعنی برنامه فقط به فایل‌هایی که خودش ساخته دسترسی دارد و بقیهٔ Drive کاربر برایش نامرئی است.</li>
+  <li>فایل‌های بکاپ در همان پوشه‌ای قرار می‌گیرند که کاربر هنگام اتصال انتخاب کرده است.</li>
+  <li>بکاپ‌های موقت پیش از آپلود، روی همان رایانه می‌مانند و پس از موفقیت پاک می‌شوند.</li>
+</ul>
+
+<h2>چه چیزی به اشتراک گذاشته می‌شود</h2>
+<p>
+  <strong>هیچ‌چیز.</strong> داده‌ها نه فروخته می‌شوند، نه به اشتراک گذاشته می‌شوند و نه به هیچ شخص ثالثی ارسال می‌شوند.
+  برنامه به هیچ سروری جز <code>googleapis.com</code> (برای ارسال و دریافت فایل‌های بکاپ) متصل نمی‌شود.
+</p>
+
+<h2>اعتبارنامه و امنیت</h2>
+<ul>
+  <li><code>client_id</code> و <code>client_secret</code> کلاینت OAuth داخل خود برنامه جاسازی شده‌اند.</li>
+  <li><code>refresh_token</code> گوگل با ChaCha20 و کلید مشتق‌شده از PBKDF2 (۲۰۰٬۰۰۰ دور) رمزنگاری می‌شود.</li>
+  <li>روی هر رایانه، اعتبارنامهٔ محلی با DPAPI ویندوز محافظت می‌شود.</li>
+</ul>
+
+<h2>نگهداری و حذف داده‌ها</h2>
+<p>کاربر در هر لحظه می‌تواند:</p>
+<ul>
+  <li>فایل‌های بکاپ را از پوشهٔ Google Drive خودش پاک کند؛</li>
+  <li>دسترسی برنامه را در صفحهٔ <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a> لغو کند؛</li>
+  <li>تمام فایل‌های محلی برنامه را از <code>%LOCALAPPDATA%\Claude9RouterTool</code> حذف کند.</li>
+</ul>
+<p>با لغو دسترسی، برنامه دیگر به هیچ داده‌ای دسترسی نخواهد داشت.</p>
+
+<h2>کودکان</h2>
+<p>این برنامه برای استفادهٔ شخصی بزرگسالان ساخته شده و برای کودکان زیر ۱۳ سال طراحی نشده است.</p>
+
+<h2>تماس</h2>
+<p>برای هر پرسشی دربارهٔ این سیاست یا دربارهٔ داده‌ها، از طریق بخش Issues مخزن پروژه درخواست بدهید:
+<a href="https://github.com/0smjp0-afk/Claude9RouterTool/issues">github.com/0smjp0-afk/Claude9RouterTool/issues</a></p>
+
+<hr style="margin:44px 0; border:none; border-top:1px solid var(--line)">
+
+<div class="en" lang="en">
+<h1 style="font-size:1.5rem">Privacy Policy — Claude9RouterTool</h1>
+<p class="sub">Last updated: 16 September 2026</p>
+
+<p>
+  Claude9RouterTool is a personal Windows backup and restore utility.
+  <strong>It sends no data to any server other than the user's own Google Drive account.</strong>
+  There is no intermediary server, no analytics, no telemetry and no tracking.
+</p>
+
+<h2>Data read</h2>
+<p>Only when the user clicks Backup or Restore, the app reads the Claude Code settings, 9Router settings, the Downloads folder, the Google Chrome profile, and any custom path the user has added — all on the local machine.</p>
+
+<h2>Where data goes</h2>
+<p>Only to the user's own Google Drive, using the <code>drive.file</code> scope, which limits access to files this app itself created. No other part of the user's Drive is visible to it.</p>
+
+<h2>Sharing</h2>
+<p>None. Data is never sold, shared or sent to any third party. The app contacts no host other than <code>googleapis.com</code>.</p>
+
+<h2>Credentials</h2>
+<p>The OAuth <code>refresh_token</code> is encrypted with ChaCha20 using a key derived via PBKDF2 (200,000 iterations); on each machine, local credentials are protected with the Windows DPAPI.</p>
+
+<h2>Deletion</h2>
+<p>The user can delete backup files from their own Drive at any time, revoke access at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>, or remove all local app data from <code>%LOCALAPPDATA%\Claude9RouterTool</code>.</p>
+
+<h2>Children</h2>
+<p>This application is intended for personal use by adults and is not designed for children under 13.</p>
+
+<h2>Contact</h2>
+<p><a href="https://github.com/0smjp0-afk/Claude9RouterTool/issues">github.com/0smjp0-afk/Claude9RouterTool/issues</a></p>
+</div>
+
+<footer>
+  <a href="index.html">بازگشت به صفحهٔ اصلی</a>
+</footer>
+
+</main>
+</body>
+</html>
