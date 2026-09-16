@@ -32,6 +32,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,11 +40,12 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 APP_NAME = "Claude9RouterTool"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 
 # ------------------------------------------------------------
 #  قفل رمز برنامه — فقط هش، هیچ‌گاه متن رمز ذخیره نمی‌شود
@@ -138,7 +140,10 @@ GD_DRIVE_API = "https://www.googleapis.com/drive/v3"
 GD_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 GD_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GD_SCOPE = "https://www.googleapis.com/auth/drive"
-GD_CHUNK = 8 * 1024 * 1024              # حجم تکه در آپلود resumable
+GD_CHUNK = 8 * 1024 * 1024              # حجم تکه در آپلود resumable (مضرب ۲۵۶KB طبق پروتکل گوگل)
+GD_MULTIPART_LIMIT = 5 * 1024 * 1024    # سقف توصیه‌شدهٔ گوگل برای آپلود multipart تک‌درخواستی
+GD_WORKERS = 4                          # تعداد آپلود/دانلود هم‌زمان
+GD_MAX_RETRIES = 4                      # تلاش مجدد با تاخیر نمایی روی 403/429/5xx
 PART_TARGET = 98 * 1024 * 1024          # حداکثر حجم محتوای هر بخش زیپ (۹۸MB)
 CHUNK_THRESHOLD = 100 * 1024 * 1024     # فایل تکی بزرگ‌تر از این به تکه‌های خام شکسته می‌شود
 CHUNK_SIZE = 98 * 1024 * 1024           # حجم هر تکه برای فایل‌های بزرگ
@@ -790,6 +795,7 @@ def build_manifest(run_id_, sources, files, dirs, warnings, parts):
 # ------------------------------------------------------------
 
 _GD_AUTH = {"client_json": "", "refresh_token": "", "token": "", "exp": 0.0}
+_GD_AUTH_LOCK = threading.Lock()   # آپلود/دانلود موازی از چند رشته توکن می‌خواهد
 _GD_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _GD_OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
@@ -862,27 +868,32 @@ def _gd_client_info(client_json):
 
 
 def gd_get_access_token():
-    """دریافت access token با Refresh Token (خودکار و بی‌صدا)."""
+    """دریافت access token با Refresh Token (خودکار و بی‌صدا).
+    قفل لازم است چون چند رشتهٔ هم‌زمان ممکن است هم‌وقت توکن بخواهند."""
     now = time.time()
     if _GD_AUTH["token"] and now < _GD_AUTH["exp"] - 60:
         return _GD_AUTH["token"]
-    if not _GD_AUTH["client_json"] or not _GD_AUTH["refresh_token"]:
-        raise RuntimeError("اعتبارنامه گوگل تنظیم نشده است")
-    client = _gd_client_info(_GD_AUTH["client_json"])
-    data = urllib.parse.urlencode({
-        "client_id": client["client_id"],
-        "client_secret": client["client_secret"],
-        "refresh_token": _GD_AUTH["refresh_token"],
-        "grant_type": "refresh_token",
-    }).encode("utf-8")
-    req = urllib.request.Request(GD_TOKEN_URL, data=data, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        res = json.loads(r.read().decode("utf-8"))
-    if "access_token" not in res:
-        raise RuntimeError("دریافت توکن گوگل ناموفق: " + str(res)[:200])
-    _GD_AUTH["token"] = res["access_token"]
-    _GD_AUTH["exp"] = now + float(res.get("expires_in", 3600))
-    return _GD_AUTH["token"]
+    with _GD_AUTH_LOCK:
+        now = time.time()
+        if _GD_AUTH["token"] and now < _GD_AUTH["exp"] - 60:
+            return _GD_AUTH["token"]
+        if not _GD_AUTH["client_json"] or not _GD_AUTH["refresh_token"]:
+            raise RuntimeError("اعتبارنامه گوگل تنظیم نشده است")
+        client = _gd_client_info(_GD_AUTH["client_json"])
+        data = urllib.parse.urlencode({
+            "client_id": client["client_id"],
+            "client_secret": client["client_secret"],
+            "refresh_token": _GD_AUTH["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode("utf-8")
+        req = urllib.request.Request(GD_TOKEN_URL, data=data, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.loads(r.read().decode("utf-8"))
+        if "access_token" not in res:
+            raise RuntimeError("دریافت توکن گوگل ناموفق: " + str(res)[:200])
+        _GD_AUTH["token"] = res["access_token"]
+        _GD_AUTH["exp"] = now + float(res.get("expires_in", 3600))
+        return _GD_AUTH["token"]
 
 
 def gd_authorize_interactive(client_json, rep=None):
@@ -993,11 +1004,35 @@ def gd_test_connection(client_json=None, refresh_token=None):
         return False, "خطا: " + str(ex)
 
 
-def gd_upload_file(folder_id, path, timeout=1800):
-    """آپلود فایل به پوشهٔ مقصد (multipart ساده؛ برای اجزای ≤۹۸MB کافی است).
-    (file_id, name, size) برمی‌گرداند."""
-    size = os.path.getsize(longpath(path))
-    metadata = {"name": os.path.basename(path), "parents": [folder_id]}
+def _gd_backoff(attempt):
+    """تاخیر نمایی — توصیهٔ رسمی گوگل برای پاسخ‌های 403/429 و خطاهای 5xx."""
+    return min(1.5 ** attempt, 30.0)
+
+
+def _gd_retryable(ex):
+    if isinstance(ex, urllib.error.HTTPError):
+        return ex.code in (403, 429, 500, 502, 503, 504)
+    return isinstance(ex, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
+
+
+def gd_call_with_retry(fn, *args, rep=None, label="", **kwargs):
+    """فراخوانی یک عملیات Drive با تلاش مجدد نمایی روی خطاهای موقت."""
+    for attempt in range(1, GD_MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as ex:
+            if not _gd_retryable(ex) or attempt >= GD_MAX_RETRIES:
+                raise
+            wait = _gd_backoff(attempt)
+            if rep:
+                rep("    تلاش مجدد " + str(attempt) + " از " + str(GD_MAX_RETRIES - 1) +
+                    " پس از " + str(int(wait)) + " ثانیه" + (" — " + label if label else ""))
+            time.sleep(wait)
+
+
+def _gd_upload_multipart(folder_id, path, size, name, timeout):
+    """آپلود تک‌درخواستی برای فایل‌های کوچک (≤۵MB به توصیهٔ گوگل)."""
+    metadata = {"name": name, "parents": [folder_id]}
     boundary = "----c9rbnd" + uuid.uuid4().hex
     meta_part = ("--" + boundary + "\r\n"
                  "Content-Type: application/json; charset=UTF-8\r\n\r\n"
@@ -1008,24 +1043,178 @@ def gd_upload_file(folder_id, path, timeout=1800):
     with open(longpath(path), "rb") as f:
         body = meta_part + f.read() + tail
     url = GD_UPLOAD_API + "/files?uploadType=multipart&fields=id,name,size"
-    tok = gd_get_access_token()
     req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Authorization": "Bearer " + tok,
+        "Authorization": "Bearer " + gd_get_access_token(),
         "Content-Type": "multipart/related; boundary=" + boundary,
         "User-Agent": USER_AGENT,
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         res = json.loads(r.read().decode("utf-8"))
-    return res["id"], res.get("name", ""), size
+    return res["id"], res.get("name", name), size
+
+
+def _gd_send_chunk(session_url, chunk, headers):
+    """یک تکه از آپلود resumable را می‌فرستد.
+    (پاسخ JSON یا None، موفق بود؟) برمی‌گرداند."""
+    for attempt in range(1, GD_MAX_RETRIES + 1):
+        try:
+            req = urllib.request.Request(session_url, data=chunk, method="PUT", headers=headers)
+            with urllib.request.urlopen(req, timeout=900) as r:
+                body = r.read()
+                return (json.loads(body.decode("utf-8")) if body else None), True
+        except urllib.error.HTTPError as ex:
+            if ex.code == 308:          # دریافت شد؛ تکهٔ بعدی را بفرست
+                return None, True
+            if ex.code in (429, 500, 502, 503, 504) and attempt < GD_MAX_RETRIES:
+                time.sleep(_gd_backoff(attempt))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            if attempt < GD_MAX_RETRIES:
+                time.sleep(_gd_backoff(attempt))
+                continue
+            return None, False
+    return None, False
+
+
+def _gd_query_offset(session_url, size):
+    """مقدار بایت‌های دریافت‌شدهٔ نشست resumable را از سرور می‌پرسد."""
+    req = urllib.request.Request(
+        session_url, data=b"", method="PUT",
+        headers={"Content-Length": "0", "Content-Range": "bytes */" + str(size),
+                 "User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return size if r.status in (200, 201) else None
+    except urllib.error.HTTPError as ex:
+        if ex.code != 308:
+            return None
+        rng = ex.headers.get("Range") if ex.headers else None
+        if not rng or "-" not in rng:
+            return None
+        try:
+            return int(rng.rsplit("-", 1)[1]) + 1
+        except ValueError:
+            return None
+    except Exception:
+        return None
+
+
+def _gd_upload_resumable(folder_id, path, size, name):
+    """آپلود تکه‌تکه — قطع اتصال وسط یک پک بزرگ فقط همان تکه را هدر می‌دهد."""
+    metadata = {"name": name, "parents": [folder_id]}
+    init_url = GD_UPLOAD_API + "/files?uploadType=resumable&fields=id,name,size"
+    req = urllib.request.Request(
+        init_url, data=json.dumps(metadata).encode("utf-8"), method="POST",
+        headers={
+            "Authorization": "Bearer " + gd_get_access_token(),
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "application/octet-stream",
+            "X-Upload-Content-Length": str(size),
+            "User-Agent": USER_AGENT,
+        })
+    with urllib.request.urlopen(req, timeout=120) as r:
+        session_url = r.headers.get("Location")
+    if not session_url:
+        raise RuntimeError("آدرس نشست آپلود resumable از گوگل دریافت نشد")
+
+    offset = 0
+    with open(longpath(path), "rb") as fh:
+        while offset < size:
+            end = min(offset + GD_CHUNK, size) - 1
+            fh.seek(offset)
+            chunk = fh.read(end - offset + 1)
+            headers = {
+                "Content-Length": str(len(chunk)),
+                "Content-Range": "bytes " + str(offset) + "-" + str(end) + "/" +
+                                 (str(size) if end + 1 >= size else "*"),
+                "User-Agent": USER_AGENT,
+            }
+            done, sent = _gd_send_chunk(session_url, chunk, headers)
+            if done is not None:
+                return done.get("id"), done.get("name", name), size
+            if sent:
+                offset = end + 1
+                continue
+            got = _gd_query_offset(session_url, size)
+            if got is None or got <= offset:
+                raise RuntimeError("آپلود resumable قطع شد و وضعیتش از سرور خوانده نشد")
+            offset = got
+    raise RuntimeError("آپلود resumable پیش از تکمیل تمام شد")
+
+
+def gd_upload_file(folder_id, path, timeout=1800):
+    """آپلود فایل به پوشهٔ مقصد. کوچک‌ها multipart و بزرگ‌ها resumable می‌روند
+    (طبق توصیهٔ رسمی گوگل، مرز ۵ مگابایت است).
+    (file_id, name, size) برمی‌گرداند."""
+    size = os.path.getsize(longpath(path))
+    name = os.path.basename(path)
+    if size <= GD_MULTIPART_LIMIT:
+        return _gd_upload_multipart(folder_id, path, size, name, timeout)
+    return _gd_upload_resumable(folder_id, path, size, name)
 
 
 def gd_download_file(file_id, dest, timeout=1800):
     """دانلود فایل Drive با alt=media و ذخیرهٔ استریمی."""
-    tok = gd_get_access_token()
     url = GD_DRIVE_API + "/files/" + urllib.parse.quote(file_id, safe="") + "?alt=media"
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok, "User-Agent": USER_AGENT})
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Bearer " + gd_get_access_token(),
+                      "User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as r, open(longpath(dest), "wb") as f:
         shutil.copyfileobj(r, f, 1024 * 256)
+
+
+def gd_upload_many(folder_id, items, rep=None, workers=None):
+    """آپلود هم‌زمان چند فایل. items: [(نام, مسیر), ...]
+    برمی‌گرداند: {نام: {"file_id": ..., "size": ...}} — ناموفق‌ها در نتیجه نیستند."""
+    out = {}
+    items = list(items)
+    if not items:
+        return out
+    workers = max(1, min(workers or GD_WORKERS, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {}
+        for name, path in items:
+            pending[pool.submit(gd_call_with_retry, gd_upload_file,
+                                folder_id, path, label=name)] = name
+        for fut in as_completed(pending):
+            name = pending[fut]
+            try:
+                fid, _fname, fsize = fut.result()
+            except Exception as ex:
+                if rep:
+                    rep("  ✗ " + name + " — " + str(ex)[:160])
+                continue
+            out[name] = {"file_id": fid, "size": fsize}
+            if rep:
+                rep("  ✓ " + name + " (" + format_bytes(fsize) + ")")
+    return out
+
+
+def gd_download_many(items, dest_dir, rep=None, workers=None):
+    """دانلود هم‌زمان چند فایل. items: [(نام, file_id), ...]"""
+    out = {}
+    items = list(items)
+    if not items:
+        return out
+    workers = max(1, min(workers or GD_WORKERS, len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {}
+        for name, fid in items:
+            pending[pool.submit(gd_call_with_retry, gd_download_file,
+                                fid, os.path.join(dest_dir, name), label=name)] = name
+        for fut in as_completed(pending):
+            name = pending[fut]
+            try:
+                fut.result()
+            except Exception as ex:
+                if rep:
+                    rep("  ✗ دانلود " + name + " ناموفق: " + str(ex)[:160])
+                continue
+            out[name] = True
+            if rep:
+                rep("  ✓ " + name)
+    return out
 
 
 def gd_delete_file(file_id):
@@ -1310,49 +1499,42 @@ def run_backup(upload=True, out_dir=None, rep=None):
         rep("✓ اعتبارنامه Google Drive آماده است.")
 
     # --- آپلود اجزای بکاپ به Drive (بکاپ قبلی هنوز دست‌نخورده) ---
-    if rep:
-        rep("آپلود بکاپ جدید به Google Drive...")
+    # موازی: گوگل سقف درخواست هم‌زمان ندارد و سهمیه‌اش (۳۲۵٬۰۰۰ واحد در دقیقه
+    # برای هر کاربر) بسیار بالاتر از چند فایل هم‌زمان است؛ روی 403/429 هم
+    # gd_call_with_retry با تاخیر نمایی دوباره تلاش می‌کند.
     all_ok = True
     files_map = {}  # نام جزء → {file_id, size}
     uploaded_ids = []
-    for name, path, sz in uploads:
-        ok_part = False
-        for attempt in range(1, 4):
-            try:
-                if rep:
-                    rep("  آپلود " + name + " (" + format_bytes(sz) + ") — تلاش " + str(attempt))
-                fid, _fn, _fs = gd_upload_file(folder_id, path)
-                files_map[name] = {"file_id": fid, "size": sz}
-                uploaded_ids.append(fid)
-                if rep:
-                    rep("  ✓ " + name)
-                ok_part = True
-                break
-            except Exception as ex:
-                if rep:
-                    rep("  خطا: " + str(ex))
-                if attempt < 3:
-                    time.sleep(2 * attempt)
-        if not ok_part:
-            if rep:
-                rep("  ✗ آپلود " + name + " ناموفق بود")
+    upload_items = [(name, path) for name, path, _sz in uploads]
+    if rep:
+        rep("آپلود " + str(len(upload_items)) + " جزء به Google Drive (" +
+            str(min(GD_WORKERS, len(upload_items) or 1)) + " فایل هم‌زمان)...")
+    up_res = gd_upload_many(folder_id, upload_items, rep=rep)
+    for name, _path in upload_items:
+        entry = up_res.get(name)
+        if entry:
+            files_map[name] = {"file_id": entry["file_id"], "size": entry["size"]}
+            uploaded_ids.append(entry["file_id"])
+        else:
             all_ok = False
 
     # --- آپلود مانیفست و لاگ (بازیابی به مانیفست نیاز دارد) ---
-    for key, path in ((run_id_ + "_manifest.json", manifest_path),
-                      (run_id_ + "_log.txt", log_path)):
-        if not all_ok:
-            break
-        try:
-            fid, _fn, _fs = gd_upload_file(folder_id, path)
-            files_map[key] = {"file_id": fid, "size": os.path.getsize(longpath(path))}
-            uploaded_ids.append(fid)
-            if rep:
-                rep("  ✓ " + key)
-        except Exception as ex:
-            if rep:
-                rep("  ✗ آپلود " + key + " ناموفق: " + str(ex))
-            all_ok = False
+    if all_ok:
+        extra_items = [(run_id_ + "_manifest.json", manifest_path),
+                       (run_id_ + "_log.txt", log_path)]
+        if rep:
+            rep("آپلود مانیفست و لاگ...")
+        extra_res = gd_upload_many(folder_id, extra_items, rep=rep)
+        for key, path in extra_items:
+            entry = extra_res.get(key)
+            if entry:
+                files_map[key] = {"file_id": entry["file_id"],
+                                  "size": os.path.getsize(longpath(path))}
+                uploaded_ids.append(entry["file_id"])
+            else:
+                all_ok = False
+    elif rep:
+        rep("  آپلود مانیفست و لاگ رد شد (برخی اجزا نرسیدند).")
 
     if not all_ok:
         if rep:
@@ -1733,6 +1915,7 @@ def run_restore(parts_dir=None, rep=None):
         return 1
 
     if not parts_dir:
+        dl_items = []
         for pk in part_keys:
             entry = (last_index.get("files") or {}).get(pk)
             if not entry or not entry.get("file_id"):
@@ -1740,32 +1923,44 @@ def run_restore(parts_dir=None, rep=None):
                     rep("  ✗ جزء " + pk + " در شاخص ثبت نشده؛ بکاپ ناقص است.")
                 logger.close()
                 return 1
-            if rep:
-                rep("دانلود " + pk + "...")
-            try:
-                gd_download_file(entry["file_id"], os.path.join(dl_dir, pk))
-                if rep:
-                    rep("  ✓ " + pk)
-            except Exception as ex:
-                if rep:
-                    rep("  ✗ دانلود " + pk + " ناموفق: " + str(ex))
-                logger.close()
-                return 1
-
-    extracted = os.path.join(staging, "extracted")
-    for pk in part_keys:
-        if pk.endswith(".c9chunk"):
-            # تکه خام فایل بزرگ — استخراج نمی‌شود، در dl_dir می‌ماند
-            continue
+            dl_items.append((pk, entry["file_id"]))
         if rep:
-            rep(f"استخراج {pk}...")
-        try:
-            extract_zip_safe(os.path.join(dl_dir, pk), extracted)
-        except Exception as ex:
+            rep("دانلود " + str(len(dl_items)) + " جزء (" +
+                str(min(GD_WORKERS, len(dl_items))) + " فایل هم‌زمان)...")
+        dl_res = gd_download_many(dl_items, dl_dir, rep=rep)
+        missing_dl = [pk for pk, _fid in dl_items if pk not in dl_res]
+        if missing_dl:
             if rep:
-                rep(f"استخراج {pk} ناموفق: {ex}")
+                rep("  ✗ دانلود ناموفق: " + "، ".join(missing_dl[:5]))
             logger.close()
             return 1
+
+    # استخراج هم‌زمان؛ zipfile حین کار zlib قفل GIL را آزاد می‌کند، پس این گام
+    # واقعاً سریع‌تر می‌شود و با دانلود موازی هم از یک الگو پیروی می‌کند.
+    extracted = os.path.join(staging, "extracted")
+    zip_keys = [pk for pk in part_keys if not pk.endswith(".c9chunk")]
+    if zip_keys:
+        if rep:
+            rep("استخراج " + str(len(zip_keys)) + " آرشیو (" +
+                str(min(GD_WORKERS, len(zip_keys))) + " هم‌زمان)...")
+        done_extract = {}
+        with ThreadPoolExecutor(max_workers=max(1, min(GD_WORKERS, len(zip_keys)))) as pool:
+            pending = {pool.submit(extract_zip_safe, os.path.join(dl_dir, pk), extracted): pk
+                       for pk in zip_keys}
+            for fut in as_completed(pending):
+                pk = pending[fut]
+                try:
+                    fut.result()
+                    done_extract[pk] = True
+                except Exception as ex:
+                    if rep:
+                        rep(f"  ✗ استخراج {pk} ناموفق: {ex}")
+        failed_extract = [pk for pk in zip_keys if pk not in done_extract]
+        if failed_extract:
+            logger.close()
+            return 1
+        if rep:
+            rep("  ✓ " + str(len(done_extract)) + " آرشیو استخراج شد")
 
     # کرومِ باز، فایل‌های پروفایلش را قفل می‌کند؛ برای بازنویسی امن بسته می‌شود
     if not os.environ.get("C9R_SELFTEST") and any(
