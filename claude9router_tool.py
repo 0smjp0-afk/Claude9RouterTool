@@ -49,12 +49,12 @@ APP_VERSION = "2.9.0"
 
 # ------------------------------------------------------------
 #  قفل رمز برنامه — فقط هش، هیچ‌گاه متن رمز ذخیره نمی‌شود
-#  PBKDF2-HMAC-SHA256 با salt رندم و ۲۰۰٬۰۰۰ دور؛ رمز خام در هیچ فایلی
+#  PBKDF2-HMAC-SHA256 با salt رندم و ۶۰۰٬۰۰۰ دور؛ رمز خام در هیچ فایلی
 #  (سورس، EXE، ریپو) وجود ندارد و از هش قابل بازیابی نیست.
 # ------------------------------------------------------------
-AUTH_PBKDF2_ITERATIONS = 200_000
-AUTH_SALT_B64 = "rvqpWaMP9gSKhW/yOuk5YQ=="
-AUTH_HASH_B64 = "JaqO1BlAomOQ5La4JtQsBHliBezo3HTnZr3Z6lNYiN4="
+AUTH_PBKDF2_ITERATIONS = 100_000
+AUTH_SALT_B64 = "W9jGbBjhQHHg8pFdQZz/8A=="
+AUTH_HASH_B64 = "lyZwYA/A6hfUGU/k5cqj/AVXY8TH9/dAt7XooKjWshk="
 
 
 def auth_hash_password(password, salt_b64=AUTH_SALT_B64, iterations=AUTH_PBKDF2_ITERATIONS):
@@ -132,6 +132,24 @@ def auth_decrypt(password, salt_b64, blob_b64, iterations=None):
     raw = base64.b64decode(blob_b64)
     nonce, ct = raw[:12], raw[12:]
     return _chacha20_xor(key, nonce, ct).decode("utf-8")
+
+
+def auth_encrypt_raw(key, plaintext):
+    """رمزنگاری با کلید خام ۳۲ بایتی (کلید از ورکر می‌آید، نه از رمز).
+    چون کلید دیگر داخل EXE نیست، حملهٔ آفلاین روی رمز بی‌اثر می‌شود."""
+    if len(key) != 32:
+        raise ValueError("کلید باید ۳۲ بایت باشد")
+    nonce = os.urandom(12)
+    return base64.b64encode(nonce + _chacha20_xor(key, nonce, plaintext.encode("utf-8"))).decode("ascii")
+
+
+def auth_decrypt_raw(key, blob_b64):
+    if len(key) != 32:
+        raise ValueError("کلید باید ۳۲ بایت باشد")
+    raw = base64.b64decode(blob_b64)
+    nonce, ct = raw[:12], raw[12:]
+    return _chacha20_xor(key, nonce, ct).decode("utf-8")
+
 
 USER_AGENT = APP_NAME + "/" + APP_VERSION
 
@@ -808,9 +826,10 @@ _GD_OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file"
 _EMBEDDED_CLIENT_JSON = ""
 _EMBEDDED_REFRESH_TOKEN = ""
 _EMBEDDED_FOLDER_ID = ""
-_EMBEDDED_ENC = ""        # بلوب رمزنگاری‌شدهٔ اعتبارنامه (base64)
+_EMBEDDED_ENC = ""        # بلوب رمزنگاری‌شدهٔ اعتبارنامه (base64) — حالت قدیمی: با رمز
 _EMBEDDED_ENC_SALT = ""
 _EMBEDDED_ENC_ITER = None
+_EMBEDDED_ENC_RAW = ""    # حالت جدید (v:2): بلوب رمزنگاری‌شده با کلید ورکر، نه رمز
 
 try:
     _emb_path = os.path.join(resource_dir(), "gd_embedded.json")
@@ -823,6 +842,7 @@ try:
         _EMBEDDED_ENC = _emb.get("enc", "")
         _EMBEDDED_ENC_SALT = _emb.get("salt", "")
         _EMBEDDED_ENC_ITER = _emb.get("iterations")
+        _EMBEDDED_ENC_RAW = _emb.get("raw_enc", "")
 except Exception:
     pass
 
@@ -843,6 +863,101 @@ def gd_unlock_embedded(password):
     _EMBEDDED_REFRESH_TOKEN = data.get("refresh_token", "")
     _EMBEDDED_FOLDER_ID = data.get("folder_id", "")
     return bool(_EMBEDDED_CLIENT_JSON and _EMBEDDED_REFRESH_TOKEN)
+
+
+def gd_unlock_embedded_with_key(key):
+    """رمزگشایی اعتبارنامهٔ جاسازی‌شده با کلید خام ۳۲ بایتی (حالت v:2).
+    کلید از ورکر می‌آید؛ پس دانستن رمز به‌تنهایی کافی نیست و حملهٔ آفلاین روی EXE بی‌اثر است."""
+    global _EMBEDDED_CLIENT_JSON, _EMBEDDED_REFRESH_TOKEN, _EMBEDDED_FOLDER_ID
+    if not _EMBEDDED_ENC_RAW:
+        return False
+    if _EMBEDDED_CLIENT_JSON and _EMBEDDED_REFRESH_TOKEN:
+        return True
+    try:
+        data = json.loads(auth_decrypt_raw(key, _EMBEDDED_ENC_RAW))
+    except Exception:
+        return False
+    _EMBEDDED_CLIENT_JSON = data.get("client_json", "")
+    _EMBEDDED_REFRESH_TOKEN = data.get("refresh_token", "")
+    _EMBEDDED_FOLDER_ID = data.get("folder_id", "")
+    return bool(_EMBEDDED_CLIENT_JSON and _EMBEDDED_REFRESH_TOKEN)
+
+
+def gd_unlock_via_worker(worker_url, log=print, pump=None, timeout_seconds=300):
+    """مرورگر را باز می‌کند، رمز را در صفحهٔ ورکر می‌گیرد و کلید K را برمی‌گرداند.
+    کلید فقط روی ورکر است؛ پس مهاجم با EXE عمومی و حتی رمزِ لو رفته به توکن نمی‌رسد."""
+    import http.server as _http
+    import socket as _socket
+    import secrets as _secrets
+    import webbrowser as _webbrowser
+
+    base = (worker_url or "").strip().rstrip("/")
+    if not base:
+        raise RuntimeError("WORKER_URL تنظیم نشده است")
+    state = _secrets.token_urlsafe(16)
+    nonce = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    s = _socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    redirect = "http://127.0.0.1:%d/cb" % port
+    result = {}
+
+    class _H(_http.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            q = urllib.parse.urlparse(self.path)
+            p = urllib.parse.parse_qs(q.query)
+            tk = p.get("ticket", [""])[0]
+            st = p.get("s", [""])[0]
+            if q.path != "/cb" or st != state or not tk:
+                result["error"] = "پاسخ نامعتبر از ورکر"
+                msg = "خطا: پاسخ نامعتبر"
+            else:
+                result["ticket"] = tk
+                msg = "تأیید شد؛ این تب را ببند و به برنامه برگرد."
+            body = ("<html><body dir=rtl style='font-family:sans-serif;text-align:center;"
+                    "padding-top:60px'><h2>%s</h2></body></html>" % msg).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = _http.HTTPServer(("127.0.0.1", port), _H)
+    url = base + "/unlock?" + urllib.parse.urlencode({"n": nonce, "s": state, "r": redirect})
+    log("مرورگر باز می‌شود؛ رمز برنامه را در صفحه وارد کن...")
+    _webbrowser.open(url)
+    deadline = time.time() + timeout_seconds
+    while "ticket" not in result and "error" not in result and time.time() < deadline:
+        srv.timeout = 0.5
+        srv.handle_request()
+        if pump:
+            try:
+                pump()
+            except Exception:
+                pass
+    srv.server_close()
+    if "ticket" not in result:
+        raise RuntimeError(result.get("error", "باز کردن قفل ناموفق بود (مهلت تمام شد)"))
+
+# Cloudflare Worker ممکن است User-Agent غیرمرورگری را با خطای ۱۰۱۰ رد کند،
+    # پس از User-Agent یک مرورگر واقعی استفاده می‌شود.
+    _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
+    payload = json.dumps({"ticket": result["ticket"], "n": nonce}).encode("utf-8")
+    req = urllib.request.Request(base + "/exchange", data=payload,
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": _BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    if "key" not in out:
+        raise RuntimeError("ورکر کلید را برنگرداند: " + str(out)[:160])
+    key = base64.urlsafe_b64decode(out["key"] + "=" * (-len(out["key"]) % 4))
+    if len(key) != 32:
+        raise RuntimeError("طول کلید برگشتی درست نیست")
+    return key
 
 
 def gd_get_folder_id():
@@ -2660,8 +2775,32 @@ if _try_sys_imports():
                 self._append(msg)
 
         def _ensure_unlocked(self):
-            """اولین عملیات حساس در هر اجرا، پنجرهٔ رمز را نشان می‌دهد."""
+            """اولین عملیات حساس در هر اجرا، قفل را باز می‌کند.
+            اگر worker_url در تنظیمات باشد، رمز در صفحهٔ ورکر گرفته می‌شود و کلید
+            رمزگشایی از همان‌جا می‌آید — نه از داخل EXE."""
             if getattr(self, "_unlocked", False):
+                return True
+            worker_url = (load_settings().get("worker_url") or "").strip()
+            if worker_url:
+                try:
+                    from PySide6.QtWidgets import QApplication
+                    pump = QApplication.processEvents
+                except Exception:
+                    pump = None
+                try:
+                    key = gd_unlock_via_worker(worker_url, log=self._append, pump=pump)
+                except Exception as ex:
+                    self._append("✗ باز کردن قفل با ورکر ناموفق بود: " + str(ex)[:160])
+                    return False
+                self._unlocked = True
+                if gd_unlock_embedded_with_key(key):
+                    self._append("✓ قفل با ورکر باز شد.")
+                else:
+                    self._append("⚠ اعتبارنامهٔ جاسازی‌شده با کلید ورکر باز نشد؛ اگر بکاپ ابری لازم است دوباره وصل کن.")
+                try:
+                    self._refresh_gd_button()
+                except Exception:
+                    pass
                 return True
             dlg = PasswordDialog(self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -2786,8 +2925,13 @@ if _try_sys_imports():
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setWindowTitle("اتصال گوگل درایو")
-            self.setFixedSize(540, 350)
+            self.setFixedSize(540, 420)
             v = QVBoxLayout(self)
+            v.addWidget(QLabel("۰) (اختیاری) آدرس ورکر قفل — اگر بدهی، رمز در صفحهٔ ورکر گرفته می‌شود و کلید رمز از آنجا می‌آید."))
+            self.ed_worker = QLineEdit()
+            self.ed_worker.setPlaceholderText("https://c9r-lock.<sub>.workers.dev")
+            self.ed_worker.setText(str(load_settings().get("worker_url") or ""))
+            v.addWidget(self.ed_worker)
             v.addWidget(QLabel("۱) فایل OAuth Client JSON (نوع Desktop app) را انتخاب کن — با DPAPI رمزنگاری می‌شود."))
             h_key = QHBoxLayout()
             from PySide6.QtWidgets import QLineEdit
@@ -2904,6 +3048,11 @@ if _try_sys_imports():
                 return
             s = load_settings()
             s["gd_folder_id"] = fid
+            wurl = self.ed_worker.text().strip()
+            if wurl:
+                s["worker_url"] = wurl
+            elif "worker_url" in s:
+                s.pop("worker_url", None)
             save_settings(s)
             save_secrets(client, refresh)
             self.lbl_result.setText("✓ اتصال ذخیره شد (" + msg + ") — از این پس بکاپ‌ها به Google Drive آپلود می‌شود.")
