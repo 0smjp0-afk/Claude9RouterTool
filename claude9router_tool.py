@@ -54,7 +54,7 @@ APP_VERSION = "2.9.0"
 # ------------------------------------------------------------
 AUTH_PBKDF2_ITERATIONS = 100_000
 AUTH_SALT_B64 = "W9jGbBjhQHHg8pFdQZz/8A=="
-AUTH_HASH_B64 = "lyZwYA/A6hfUGU/k5cqj/AVXY8TH9/dAt7XooKjWshk="
+AUTH_HASH_B64 = "ZJ7iuU255Mc9kqHf07Wj8Zif78lDmMppqibMorjAjMQ="
 
 
 def auth_hash_password(password, salt_b64=AUTH_SALT_B64, iterations=AUTH_PBKDF2_ITERATIONS):
@@ -158,9 +158,13 @@ GD_DRIVE_API = "https://www.googleapis.com/drive/v3"
 GD_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 GD_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GD_SCOPE = "https://www.googleapis.com/auth/drive"
-GD_CHUNK = 8 * 1024 * 1024              # حجم تکه در آپلود resumable (مضرب ۲۵۶KB طبق پروتکل گوگل)
+GD_CHUNK = 64 * 1024 * 1024             # حجم تکه در آپلود resumable (مضرب ۲۵۶KB طبق پروتکل گوگل)
+                                        # ↑ از ۸MB به ۶۴MB: هر تکه یک رفت‌وبرگشت شبکه است؛
+                                        # با ۶۴MB هر بخش ~۹۸MB فقط ۲ رفت‌وبرگشت می‌خواهد (قبلاً ۱۲)
 GD_MULTIPART_LIMIT = 5 * 1024 * 1024    # سقف توصیه‌شدهٔ گوگل برای آپلود multipart تک‌درخواستی
-GD_WORKERS = 4                          # تعداد آپلود/دانلود هم‌زمان
+GD_WORKERS = 8                          # تعداد آپلود/دانلود هم‌زمان
+                                        # ↑ از ۴ به ۸: تاخیر شبکه (RTT) را می‌پوشاند؛ سرعت هر اتصال
+                                        # محدود است، پس تعداد اتصال بیشتر = پهنای باند بیشتری استفاده می‌شود
 GD_MAX_RETRIES = 4                      # تلاش مجدد با تاخیر نمایی روی 403/429/5xx
 PART_TARGET = 98 * 1024 * 1024          # حداکثر حجم محتوای هر بخش زیپ (۹۸MB)
 CHUNK_THRESHOLD = 100 * 1024 * 1024     # فایل تکی بزرگ‌تر از این به تکه‌های خام شکسته می‌شود
@@ -739,11 +743,14 @@ def assign_parts(entries_files, target):
 
 def write_archives(run_id_, parts, dir_entries, out_dir, warnings, logger, rep=None, vss=None, kind="part", extra_text=None):
     created = []
+    # compresslevel=1 (سریع‌ترین zlib) — روی داده‌های بکاپ (عکس/فیلم/فایل‌های ازقبل‌فشرده)
+    # اختلاف حجم با سطح ۶ معمولاً زیر ~۱۰٪ است ولی سرعت فشرده‌سازی ۳ تا ۴ برابر می‌شود.
+    # گلوگاه واقعی سرعتِ آپلود اینترنت است، پس فشرده‌سازی سبک‌تر کل عملیات را جلو می‌اندازد.
     for i, part in enumerate(parts, 1):
         name = f"{run_id_}_{kind}{i}.zip"
         path = os.path.join(out_dir, name)
         zipped, size = 0, 0
-        with zipfile.ZipFile(longpath(path), "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        with zipfile.ZipFile(longpath(path), "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
             if i == 1:
                 for d in dir_entries:
                     z.writestr(d["arcname"] + "/", "")
@@ -1271,7 +1278,17 @@ def _gd_upload_resumable(folder_id, path, size, name):
         while offset < size:
             end = min(offset + GD_CHUNK, size) - 1
             fh.seek(offset)
-            chunk = fh.read(end - offset + 1)
+            # تکه را در چند حلقه می‌خوانیم ( نه یک read بزرگ) تا حافظهٔ غیرضروری گرفته نشود؛
+            # ولی با بافر ۱MB، نه ۴KB پیش‌فرض
+            chunk = bytearray()
+            remaining = end - offset + 1
+            while remaining > 0:
+                buf = fh.read(min(1024 * 1024, remaining))
+                if not buf:
+                    break
+                chunk += buf
+                remaining -= len(buf)
+            chunk = bytes(chunk)
             headers = {
                 "Content-Length": str(len(chunk)),
                 "Content-Range": "bytes " + str(offset) + "-" + str(end) + "/" +
@@ -1309,7 +1326,8 @@ def gd_download_file(file_id, dest, timeout=1800):
         url, headers={"Authorization": "Bearer " + gd_get_access_token(),
                       "User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as r, open(longpath(dest), "wb") as f:
-        shutil.copyfileobj(r, f, 1024 * 256)
+        # بافر ۱MB (به‌جای ۲۵۶KB): تعداد فراخوانی سیستم را روی دانلود چندگیگابایتی می‌کاهد
+        shutil.copyfileobj(r, f, 1024 * 1024)
 
 
 def gd_upload_many(folder_id, items, rep=None, workers=None):
@@ -1585,7 +1603,7 @@ def run_backup(upload=True, out_dir=None, rep=None):
         f.write(log_text)
 
     try:
-        with zipfile.ZipFile(longpath(archives[0][1]), "a", zipfile.ZIP_DEFLATED) as z:
+        with zipfile.ZipFile(longpath(archives[0][1]), "a", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
             # خلاصهٔ مانیفست (بدون فهرست کامل فایل‌ها) تا زیپ بخش اول از سقف دانلود ربات (۲۰MB) رد نشود؛
             # مانیفست کامل به‌صورت Document جداگانه ارسال می‌شود
             summary = {k: v for k, v in manifest.items() if k not in ("files", "dirs")}
@@ -2135,22 +2153,24 @@ def run_restore(parts_dir=None, rep=None):
             continue
         dst = e["path"]
         if e.get("chunked") and isinstance(e.get("chunks"), list):
-            # فایل تکه‌شده: تکه‌ها را به‌ترتیب به هم بچسبان و بازگردان
+            # فایل تکه‌شده: تکه‌ها را به‌ترتیب مستقیم به مقصد بچسبان (بدون tmp+copy2)
+            # قبلاً اول در tmp می‌نوشت و بعد copy2 می‌کرد = دو بار نوشتنِ کل فایل.
+            # برای فایل ۵+ گیگابایتی این یعنی نصف‌شدن سرعت ریستور فایل‌های بزرگ.
             try:
-                tmpf = os.path.join(staging, "chunk_" + uuid.uuid4().hex[:8])
-                with open(longpath(tmpf), "wb") as out:
+                os.makedirs(longpath(os.path.dirname(dst)), exist_ok=True)
+                written = 0
+                with open(longpath(dst), "wb") as out:
                     for c in sorted(e["chunks"], key=lambda c: c.get("start", 0)):
                         cp = os.path.join(dl_dir, str(c.get("key", "")))
                         if not os.path.isfile(longpath(cp)):
                             raise OSError("تکه یافت نشد: " + str(c.get("key", "?")))
                         with open(longpath(cp), "rb") as fh:
-                            shutil.copyfileobj(fh, out)
-                if os.path.getsize(longpath(tmpf)) != e["size"]:
+                            shutil.copyfileobj(fh, out, 1024 * 1024)
+                if os.path.getsize(longpath(dst)) != e["size"]:
                     raise OSError("اندازه فایل بازسازی‌شده از تکه‌ها تطابق ندارد")
-                os.makedirs(longpath(os.path.dirname(dst)), exist_ok=True)
-                shutil.copy2(longpath(tmpf), longpath(dst))
                 try:
-                    os.remove(longpath(tmpf))
+                    ts = os.path.getmtime(dst)
+                    os.utime(longpath(dst), (ts, ts))
                 except OSError:
                     pass
                 results["files_ok"] += 1
