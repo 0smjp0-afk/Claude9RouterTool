@@ -12,6 +12,7 @@ a = Analysis(
         ('assets/fonts/Vazirmatn-Medium.ttf', 'assets/fonts'),
         ('assets/fonts/Vazirmatn-Bold.ttf', 'assets/fonts'),
         ('gd_embedded.json', '.'),
+        ('assets/oauth-client.json', 'assets'),
         ('assets/setup/RUN-Setup.bat', 'assets/setup'),
         ('assets/setup/Setup-FaKeyboard-Chrome-Dark.ps1', 'assets/setup'),
         ('assets/setup/Setup-FaKeyboard-DarkTheme.ps1', 'assets/setup'),

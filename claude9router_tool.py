@@ -196,6 +196,26 @@ def asset_path(name):
     return os.path.join(resource_dir(), "assets", name)
 
 
+def bundled_client_json():
+    """کلاینت OAuth که داخل خود برنامه جاسازی شده (assets/oauth-client.json).
+    فقط «گام ۱» را پیش‌پر می‌کند تا کاربر مجبور نباشد فایل را دستی انتخاب کند؛
+    اگر کاربر فایل دیگری انتخاب کند، همان مقدار جایگزین می‌شود.
+    client_secretِ نوع Desktop app عمومی است و لو رفتنش به‌تنهایی دسترسی نمی‌دهد —
+    دسترسی فقط با refresh_token است که اینجا جاسازی نمی‌شود."""
+    try:
+        p = os.path.join(resource_dir(), "assets", "oauth-client.json")
+        if not os.path.isfile(p):
+            return ""
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        inner = data.get("installed") if isinstance(data.get("installed"), dict) else data
+        if not isinstance(inner, dict) or not inner.get("client_id") or not inner.get("client_secret"):
+            return ""
+        return json.dumps(data)
+    except Exception:
+        return ""
+
+
 # ------------------------------------------------------------
 #  ابزارهای عمومی
 # ------------------------------------------------------------
@@ -2937,9 +2957,10 @@ if _try_sys_imports():
             from PySide6.QtWidgets import QLineEdit
             self.ed_key = QLineEdit()
             self.ed_key.setEchoMode(QLineEdit.EchoMode.Password)
-            self.ed_key.setPlaceholderText("مسیر فایل JSON کلاینت OAuth")
             if load_secrets().get("client_json"):
                 self.ed_key.setPlaceholderText("کلاینت فعلی ذخیره شده — برای تغییر، مسیر جدید بده")
+            elif bundled_client_json():
+                self.ed_key.setPlaceholderText("کلاینت داخل برنامه آماده است — فقط اگر خواستی فایل دیگری بده")
             self.b_browse = QPushButton("انتخاب...")
             h_key.addWidget(self.ed_key, 1)
             h_key.addWidget(self.b_browse)
@@ -2967,7 +2988,7 @@ if _try_sys_imports():
             self.b_auth.clicked.connect(self.do_auth)
             self.b_save.clicked.connect(self.do_save)
             self.b_cancel.clicked.connect(self.reject)
-            self._client_json = ""
+            self._client_json = bundled_client_json() or ""
             self._refresh_token = ""
 
         def do_browse(self):
